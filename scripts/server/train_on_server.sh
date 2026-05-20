@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${1:-${SCRIPT_DIR}/server_paths.env}"
+STAGE="${2:-all}"
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Missing env file: ${ENV_FILE}" >&2
+  echo "Copy ${SCRIPT_DIR}/server_paths.env.example to ${SCRIPT_DIR}/server_paths.env and edit it." >&2
+  exit 1
+fi
+
+set -a
+source "${ENV_FILE}"
+set +a
+
+source "${VENV_DIR}/bin/activate"
+export HF_HOME="${HF_HOME}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE}"
+export HF_HUB_CACHE="${HF_HUB_CACHE}"
+
+DATA_ROOT="${SERVER_DATA_ROOT}" \
+DATASET_ROOT="${DATASET_ROOT}" \
+SCORES_JSON="${REPO_DIR}/src/prep_data/scores.json" \
+ALIGNER_MODEL="${ALIGNER_MODEL_DIR:-${ALIGNER_MODEL}}" \
+WHISPER_BASE_MODEL="${WHISPER_BASE_MODEL_DIR}" \
+TIMESTAMP_BACKEND="${TIMESTAMP_BACKEND}" \
+LANGUAGE="${LANGUAGE}" \
+CHUNK_SEC="${CHUNK_SEC}" \
+RIGHT_CONTEXT_SEC="${RIGHT_CONTEXT_SEC}" \
+MIN_UTT_MATCH_RATIO="${MIN_UTT_MATCH_RATIO}" \
+WHISPER_BATCH_SIZE="${WHISPER_BATCH_SIZE}" \
+WHISPER_EVAL_BATCH_SIZE="${WHISPER_EVAL_BATCH_SIZE}" \
+WHISPER_EPOCHS="${WHISPER_EPOCHS}" \
+GOPT_BATCH_SIZE="${GOPT_BATCH_SIZE}" \
+GOPT_EPOCHS="${GOPT_EPOCHS}" \
+GOPT_DEPTH="${GOPT_DEPTH}" \
+GOPT_HEADS="${GOPT_HEADS}" \
+GOPT_EMBED_DIM="${GOPT_EMBED_DIM}" \
+GOPT_MAIN_CONTEXT_TOKENS="${GOPT_MAIN_CONTEXT_TOKENS}" \
+GOPT_RIGHT_CONTEXT_TOKENS="${GOPT_RIGHT_CONTEXT_TOKENS}" \
+AUTO_RESUME=1 \
+PYTHON_BIN=python \
+"${REPO_DIR}/src/run_streaming_whisper_gopt_wsl.sh" "${STAGE}"

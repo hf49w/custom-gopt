@@ -133,16 +133,18 @@ class Block(nn.Module):
 
 # standard GOPT model proposed in the paper
 class GOPT(nn.Module):
-    def __init__(self, embed_dim, num_heads, depth, input_dim=84):
+    def __init__(self, embed_dim, num_heads, depth, input_dim=84, seq_len=50, phn_num=40):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.seq_len = seq_len
+        self.phn_num = phn_num
         # Transformer encode blocks
         self.blocks = nn.ModuleList([Block(dim=embed_dim, num_heads=num_heads) for i in range(depth)])
 
-        # sin pos embedding or learnable pos embedding, 55 = 50 sequence length + 5 utt-level cls tokens
+        # sin pos embedding or learnable pos embedding, seq_len + 5 = phone tokens + utt-level cls tokens
         #self.pos_embed = nn.Parameter(get_sinusoid_encoding(55, self.embed_dim) * 0.1, requires_grad=True)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 55, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len + 5, self.embed_dim))
         trunc_normal_(self.pos_embed, std=.02)
 
         # for phone classification
@@ -154,8 +156,8 @@ class GOPT(nn.Module):
         self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
 
-        # canonical phone projection, assume there are 40 phns
-        self.phn_proj = nn.Linear(40, embed_dim)
+        # canonical phone projection, phn_num includes the padding bucket.
+        self.phn_proj = nn.Linear(self.phn_num, embed_dim)
 
         # utterance level, 1=accuracy, 2=completeness, 3=fluency, 4=prosodic, 5=total score
         self.cls_token1 = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -184,7 +186,7 @@ class GOPT(nn.Module):
         B = x.shape[0]
 
         # phn_one_hot in shape [batch_size, seq_len, feat_dim]
-        phn_one_hot = torch.nn.functional.one_hot(phn.long()+1, num_classes=40).float()
+        phn_one_hot = torch.nn.functional.one_hot(phn.long()+1, num_classes=self.phn_num).float()
         # phn_embed in shape [batch_size, seq_len, embed_dim]
         phn_embed = self.phn_proj(phn_one_hot)
 
@@ -227,15 +229,17 @@ class GOPT(nn.Module):
 
 # GOPT model without canonical phone embedding, performance worse than standard GOPT model
 class GOPTNoPhn(nn.Module):
-    def __init__(self, embed_dim, num_heads, depth, input_dim=84):
+    def __init__(self, embed_dim, num_heads, depth, input_dim=84, seq_len=50, phn_num=40):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.seq_len = seq_len
+        self.phn_num = phn_num
         self.blocks = nn.ModuleList([Block(dim=embed_dim, num_heads=num_heads) for i in range(depth)])
 
         # sin pos embedding
         #self.pos_embed = nn.Parameter(get_sinusoid_encoding(55, self.embed_dim) * 0.1, requires_grad=True)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 55, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len + 5, self.embed_dim))
         trunc_normal_(self.pos_embed, std=.02)
 
         # for phone classification
@@ -248,7 +252,7 @@ class GOPTNoPhn(nn.Module):
         self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
 
         # phone projection
-        self.phn_proj = nn.Linear(40, embed_dim)
+        self.phn_proj = nn.Linear(self.phn_num, embed_dim)
 
         # utterance level
         self.cls_token1 = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -277,7 +281,7 @@ class GOPTNoPhn(nn.Module):
         B = x.shape[0]
 
         # phn_one_hot in shape [batch_size, seq_len, feat_dim]
-        phn_one_hot =  torch.nn.functional.one_hot(phn.long()+1, num_classes=40).float()
+        phn_one_hot =  torch.nn.functional.one_hot(phn.long()+1, num_classes=self.phn_num).float()
         # phn_embed in shape [batch_size, seq_len, embed_dim]
         phn_embed = self.phn_proj(phn_one_hot)
 

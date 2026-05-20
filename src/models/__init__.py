@@ -7,3 +7,4 @@
 
 from .gopt import *
 from .baseline import *
+from .streaming_gopt import *
