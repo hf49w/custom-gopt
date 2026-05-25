@@ -40,6 +40,8 @@ Fill in at least:
 - `SERVER_PORT`
 - `LOCAL_DATASET_ROOT`
 - `LOCAL_WHISPER_BASE_MODEL_DIR`
+- `LOCAL_CHARSIU_SRC_DIR`
+- `LOCAL_ALIGNER_MODEL_DIR`
 
 ## 5. Local Machine: Upload Dataset And Whisper Model
 
@@ -52,6 +54,8 @@ This uploads:
 
 - SpeechOcean762 dataset directory to `${SERVER_DATA_ROOT}/speechocean762/speechocean762`
 - Whisper base model directory to `${WHISPER_BASE_MODEL_DIR}`
+- Official Charsiu repo directory to `${CHARSIU_SRC_DIR}`
+- Charsiu frame-classification checkpoint directory to `${ALIGNER_MODEL_DIR}`
 
 ## 6. Server: Clone Repo And Build Environment
 
@@ -69,6 +73,21 @@ Edit `scripts/server/server_paths.env`, then run:
 chmod +x scripts/server/setup_server_env.sh
 ./scripts/server/setup_server_env.sh scripts/server/server_paths.env
 ```
+
+If the system disk is small, keep all install-time caches on the project disk:
+
+- set `ENV_MANAGER="conda"`
+- set `CONDA_ENV_PREFIX` to a directory under the project disk
+- set `TMPDIR`, `PIP_CACHE_DIR`, and `CONDA_PKGS_DIRS` under the project disk
+
+This avoids `No space left on device` during large `torch` downloads.
+
+For official Charsiu mode, also set:
+
+- `CHARSIU_SRC_DIR` to the uploaded Charsiu repo root or its `src/` directory
+- `ALIGNER_MODEL_DIR` to the uploaded `charsiu_en_w2v2_tiny_fc_10ms` directory
+
+The preprocessing scripts import `Charsiu.charsiu_forced_aligner` from `CHARSIU_SRC_DIR` and no longer rely on a hand-built `AutoProcessor` fallback.
 
 ## 7. Server: Train
 

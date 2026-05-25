@@ -1,7 +1,10 @@
 import argparse
 import json
 import math
+import os
+import pickle
 import re
+import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -9,18 +12,20 @@ import librosa
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoProcessor, pipeline
+from transformers import pipeline
 
 from build_charsiu_seq_data import (
     EPS,
+    align_reference_utterance,
     audio_logits,
+    build_silence_keep_mask,
     build_model_phone_map,
     build_reference_word_records,
-    load_frame_model,
+    load_official_charsiu_aligner,
     monotonic_align,
     normalize_phone,
     normalize_word,
-    parse_wav_scp,
+    resolve_dataset_splits,
     segment_feature,
 )
 from build_streaming_charsiu_data import commit_schedule
@@ -31,9 +36,14 @@ def get_args():
     parser.add_argument('--dataset-root', type=str, required=True, help='SpeechOcean762 root that contains train/test wav.scp and WAVE/.')
     parser.add_argument('--scores-json', type=str, default='src/prep_data/scores.json')
     parser.add_argument('--train-scp', type=str, default=None)
+    parser.add_argument('--val-scp', type=str, default=None)
     parser.add_argument('--test-scp', type=str, default=None)
+    parser.add_argument('--val-speaker-ratio', type=float, default=0.5, help='When --val-scp is not set, hold out this fraction of original test speakers for validation.')
+    parser.add_argument('--split-seed', type=int, default=1337)
     parser.add_argument('--output-dir', type=str, default='data/streaming_asr_gopt')
     parser.add_argument('--aligner-model', type=str, default='charsiu/en_w2v2_tiny_fc_10ms')
+    parser.add_argument('--charsiu-src-dir', type=str, default=os.environ.get('CHARSIU_SRC_DIR'))
+    parser.add_argument('--charsiu-lang', type=str, default=os.environ.get('CHARSIU_LANG', 'en'))
     parser.add_argument('--asr-model', type=str, default='openai/whisper-base')
     parser.add_argument('--timestamp-backend', type=str, default='transformers', choices=['transformers', 'whisper_timestamped'])
     parser.add_argument('--language', type=str, default='english')
@@ -45,6 +55,8 @@ def get_args():
     parser.add_argument('--min-utt-match-ratio', type=float, default=0.5, help='Minimum matched committed-word ratio required to keep utterance loss on final chunk.')
     parser.add_argument('--beam-size', type=int, default=1)
     parser.add_argument('--best-of', type=int, default=1)
+    parser.add_argument('--asr-batch-size', type=int, default=16, help='Batch size used when decoding prefix chunks with the transformers Whisper pipeline.')
+    parser.add_argument('--resume', action='store_true', help='Resume from per-utterance progress files in output-dir/progress.')
     parser.add_argument('--overwrite', action='store_true')
     return parser.parse_args()
 
@@ -170,26 +182,37 @@ def extract_words_from_whisper_timestamped(result):
     return words
 
 
-def transcribe_audio_prefix(audio_prefix, sample_rate, backend_name, backend_model, backend_kwargs, language, beam_size, best_of):
+def transcribe_audio_prefixes(audio_prefixes, sample_rate, backend_name, backend_model, backend_kwargs, language, beam_size, best_of, asr_batch_size):
+    if not audio_prefixes:
+        return []
     if backend_name == 'transformers':
-        result = backend_model(
-            {
-                'array': audio_prefix,
-                'sampling_rate': sample_rate,
-            },
+        results = backend_model(
+            [
+                {
+                    'array': audio_prefix,
+                    'sampling_rate': sample_rate,
+                }
+                for audio_prefix in audio_prefixes
+            ],
+            batch_size=asr_batch_size,
             **backend_kwargs,
         )
-        return extract_words_from_transformers(result)
+        if isinstance(results, dict):
+            results = [results]
+        return [extract_words_from_transformers(result) for result in results]
 
     whisper = backend_kwargs['module']
-    result = whisper.transcribe(
-        backend_model,
-        audio_prefix,
-        language=language,
-        beam_size=beam_size,
-        best_of=best_of,
-    )
-    return extract_words_from_whisper_timestamped(result)
+    outputs = []
+    for audio_prefix in audio_prefixes:
+        result = whisper.transcribe(
+            backend_model,
+            audio_prefix,
+            language=language,
+            beam_size=beam_size,
+            best_of=best_of,
+        )
+        outputs.append(extract_words_from_whisper_timestamped(result))
+    return outputs
 
 
 def select_visible_frames(probs, keep_mask, audio_end, frame_step):
@@ -200,60 +223,30 @@ def select_visible_frames(probs, keep_mask, audio_end, frame_step):
     return np.flatnonzero(visible_mask), probs[visible_mask]
 
 
-def align_gold_utterance(utt_id, audio_path, scores, processor, model, sample_rate, device, min_sil_frames):
-    if utt_id not in scores or not audio_path.exists():
-        return None
+def align_gold_utterance(utt_id, audio_path, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict):
+    aligned = align_reference_utterance(
+        utt_id=utt_id,
+        audio_path=audio_path,
+        scores=scores,
+        charsiu=charsiu,
+        sample_rate=sample_rate,
+        device=device,
+        phone_to_frame_id=phone_to_frame_id,
+        phn_dict=phn_dict,
+    )
+    if 'skip_reason' in aligned:
+        return aligned
 
     gold_words = build_reference_word_records(scores[utt_id])
-    probs, audio_duration = audio_logits(audio_path, processor, model, sample_rate, device)
+    probs, audio_duration = audio_logits(audio_path, charsiu.charsiu_processor, charsiu.aligner, sample_rate, device)
     frame_step = audio_duration / max(len(probs), 1)
-    frame_labels = np.argmax(probs, axis=-1)
-    phone_to_frame_id, _, silence_ids = build_model_phone_map(model)
-    keep_mask = np.ones(len(probs), dtype=bool)
-    if silence_ids:
-        silence_ids = set(int(x) for x in silence_ids)
-        start = 0
-        while start < len(frame_labels):
-            cur = int(frame_labels[start])
-            end = start + 1
-            while end < len(frame_labels) and int(frame_labels[end]) == cur:
-                end += 1
-            if cur in silence_ids and (end - start) >= min_sil_frames:
-                keep_mask[start:end] = False
-            start = end
-        if not np.any(keep_mask):
-            keep_mask[:] = True
-
-    word_end_times = {}
+    keep_mask = build_silence_keep_mask(charsiu, probs)
     word_start_times = {}
-    visible_phone_seq = []
-    for word in gold_words:
-        visible_phone_seq.extend(word['phones'])
-    missing_phone = next((phone for phone in visible_phone_seq if phone not in phone_to_frame_id), None)
-    if missing_phone is not None:
-        return {'utt_id': utt_id, 'skip_reason': f'phone_not_in_model_vocab:{missing_phone}'}
-
-    kept_indices = np.flatnonzero(keep_mask)
-    kept_probs = probs[keep_mask]
-    try:
-        phone_ids = [phone_to_frame_id[phone] for phone in visible_phone_seq]
-        path = monotonic_align(-np.log(np.clip(kept_probs, EPS, None)), phone_ids)
-    except Exception as exc:
-        return {'utt_id': utt_id, 'skip_reason': f'gold_alignment_failed:{exc}'}
-
-    phone_offset = 0
-    for word in gold_words:
-        word_frames = []
-        for _ in word['phones']:
-            tok_frames = kept_indices[path == phone_offset]
-            if tok_frames.size == 0:
-                return {'utt_id': utt_id, 'skip_reason': f'empty_gold_phone_segment:{phone_offset}'}
-            word_frames.append(tok_frames)
-            phone_offset += 1
-        start_time = float(word_frames[0][0] * frame_step)
-        end_time = float((word_frames[-1][-1] + 1) * frame_step)
-        word_start_times[word['word_id']] = start_time
-        word_end_times[word['word_id']] = end_time
+    word_end_times = {}
+    for phone in aligned['phones']:
+        word_id = int(phone['word_id'])
+        word_start_times[word_id] = min(word_start_times.get(word_id, phone['start_time']), phone['start_time'])
+        word_end_times[word_id] = max(word_end_times.get(word_id, 0.0), phone['end_time'])
 
     return {
         'utt_id': utt_id,
@@ -265,180 +258,206 @@ def align_gold_utterance(utt_id, audio_path, scores, processor, model, sample_ra
         'word_start_times': word_start_times,
         'word_end_times': word_end_times,
         'gold_words': gold_words,
-        'utt_scores': {
-            'accuracy': float(scores[utt_id]['accuracy']),
-            'completeness': float(scores[utt_id]['completeness']),
-            'fluency': float(scores[utt_id]['fluency']),
-            'prosodic': float(scores[utt_id]['prosodic']),
-            'total': float(scores[utt_id]['total']),
-        },
+        'utt_scores': aligned['utt_scores'],
     }
 
 
-def align_split(split_items, scores, processor, model, sample_rate, device, min_sil_frames):
+def align_split(split_items, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict):
     aligned = []
     skipped = []
     for utt_id, audio_path in tqdm(split_items, desc='gold-align'):
-        result = align_gold_utterance(utt_id, audio_path, scores, processor, model, sample_rate, device, min_sil_frames)
-        if result is None:
-            skipped.append({'utt_id': utt_id, 'skip_reason': 'missing_scores_or_audio'})
-        elif 'skip_reason' in result:
+        result = align_gold_utterance(utt_id, audio_path, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict)
+        if 'skip_reason' in result:
             skipped.append(result)
         else:
             aligned.append(result)
     return aligned, skipped
 
 
+def build_chunk_examples_for_utterance(item, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, phn_dict, phone_to_frame_id):
+    examples = []
+    skipped_chunks = []
+    utt_id = item['utt_id']
+    audio, _ = librosa.load(item['audio_path'], sr=args.sample_rate, mono=True)
+    gold_words = item['gold_words']
+    final_time = max(item['word_end_times'].values()) if item['word_end_times'] else item['audio_duration']
+    prev_visible_words = []
+    chunk_specs = []
+    audio_prefixes = []
+
+    for chunk_id, commit_time in enumerate(commit_schedule(final_time, args.chunk_sec)):
+        is_final = abs(commit_time - final_time) < 1e-5
+        audio_end = final_time if is_final else min(final_time, commit_time + args.right_context_sec)
+        chunk_specs.append({
+            'chunk_id': int(chunk_id),
+            'commit_time': float(commit_time),
+            'is_final': bool(is_final),
+            'audio_end': float(audio_end),
+        })
+        audio_prefixes.append(audio[: int(max(audio_end, 1e-4) * args.sample_rate)])
+
+    asr_outputs = transcribe_audio_prefixes(
+        audio_prefixes=audio_prefixes,
+        sample_rate=args.sample_rate,
+        backend_name=asr_backend_name,
+        backend_model=asr_backend_model,
+        backend_kwargs=asr_backend_kwargs,
+        language=args.language,
+        beam_size=args.beam_size,
+        best_of=args.best_of,
+        asr_batch_size=args.asr_batch_size,
+    )
+
+    for spec, asr_words in zip(chunk_specs, asr_outputs):
+        chunk_id = spec['chunk_id']
+        commit_time = spec['commit_time']
+        is_final = spec['is_final']
+        audio_end = spec['audio_end']
+        if not asr_words:
+            skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'empty_asr_hypothesis'})
+            prev_visible_words = []
+            continue
+
+        timestamp_commit_len = sum(1 for word in asr_words if word['end'] <= commit_time + 1e-6)
+        stable_prefix_len = longest_common_prefix_len(prev_visible_words, asr_words) if prev_visible_words else timestamp_commit_len
+        committed_len = timestamp_commit_len if is_final else min(timestamp_commit_len, stable_prefix_len)
+        prev_visible_words = asr_words
+
+        asr_to_gold = lcs_align_words(asr_words, gold_words)
+        pseudo_records = []
+        matched_committed_words = 0
+        committed_lexicon_words = 0
+        visible_word_local_id = 0
+
+        for asr_idx, asr_word in enumerate(asr_words):
+            phones = lexicon.get(asr_word['text'])
+            if not phones:
+                continue
+            committed = asr_idx < committed_len
+            if committed:
+                committed_lexicon_words += 1
+
+            gold_idx = asr_to_gold[asr_idx]
+            gold_word = None
+            word_match = False
+            if gold_idx >= 0 and gold_words[gold_idx]['text'] == asr_word['text']:
+                gold_word = gold_words[gold_idx]
+                if gold_word['phones'] == phones:
+                    word_match = True
+            if committed and word_match:
+                matched_committed_words += 1
+
+            for phone_idx, phone in enumerate(phones):
+                if phone not in phone_to_frame_id or phone not in phn_dict:
+                    continue
+                phone_score = -1.0
+                word_accuracy = -1.0
+                word_stress = -1.0
+                word_total = -1.0
+                loss_ok = False
+                if word_match and gold_word is not None and phone_idx < len(gold_word['phone_scores']):
+                    phone_score = float(gold_word['phone_scores'][phone_idx])
+                    word_accuracy = float(gold_word['accuracy'])
+                    word_stress = float(gold_word['stress'])
+                    word_total = float(gold_word['total'])
+                    loss_ok = committed
+                pseudo_records.append({
+                    'phone': phone,
+                    'phone_id': int(phn_dict[phone]),
+                    'phone_score': phone_score,
+                    'word_local_id': int(visible_word_local_id),
+                    'word_accuracy': word_accuracy,
+                    'word_stress': word_stress,
+                    'word_total': word_total,
+                    'word_match': bool(word_match),
+                    'committed': bool(committed),
+                    'word_end': float(asr_word['end']),
+                    'phone_loss_ok': bool(loss_ok),
+                    'display_word': asr_word['display_text'],
+                })
+            visible_word_local_id += 1
+
+        if not pseudo_records:
+            skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'no_alignable_asr_phones'})
+            continue
+
+        kept_indices, kept_probs = select_visible_frames(item['probs'], item['keep_mask'], audio_end, item['frame_step'])
+        if kept_probs.shape[0] < len(pseudo_records):
+            skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'not_enough_frames_for_asr_phones'})
+            continue
+
+        try:
+            phone_ids = [phone_to_frame_id[record['phone']] for record in pseudo_records]
+            path = monotonic_align(-np.log(np.clip(kept_probs, EPS, None)), phone_ids)
+        except Exception as exc:
+            skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': f'asr_alignment_failed:{exc}'})
+            continue
+
+        segments = []
+        for tok_idx, record in enumerate(pseudo_records):
+            tok_frames = kept_indices[path == tok_idx]
+            if tok_frames.size == 0:
+                segments = []
+                break
+            target_id = phone_to_frame_id[record['phone']]
+            feature = segment_feature(item['probs'][tok_frames], target_id, item['frame_step'])
+            end_time = float((int(tok_frames[-1]) + 1) * item['frame_step'])
+            segments.append({
+                'feature': feature.astype(np.float32),
+                'phone_id': int(record['phone_id']),
+                'phone_score': float(record['phone_score']),
+                'word_id': int(record['word_local_id']),
+                'word_accuracy': float(record['word_accuracy']),
+                'word_stress': float(record['word_stress']),
+                'word_total': float(record['word_total']),
+                'phone_loss_mask': float(record['phone_loss_ok'] and end_time <= commit_time + 1e-6),
+                'word_loss_mask': float(record['phone_loss_ok'] and record['word_end'] <= commit_time + 1e-6),
+                'end_time': end_time,
+            })
+        if not segments:
+            skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'empty_asr_phone_segment'})
+            continue
+
+        matched_ratio = float(matched_committed_words) / float(max(committed_lexicon_words, 1))
+        utt_loss_mask = float(is_final and matched_ratio >= args.min_utt_match_ratio)
+        phone_loss_count = sum(segment['phone_loss_mask'] for segment in segments)
+        word_loss_count = sum(segment['word_loss_mask'] for segment in segments)
+        if phone_loss_count == 0 and word_loss_count == 0 and utt_loss_mask == 0:
+            skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'no_supervised_tokens_after_matching'})
+            continue
+        examples.append({
+            'utt_id': utt_id,
+            'chunk_id': int(chunk_id),
+            'audio_end': float(audio_end),
+            'commit_time': float(commit_time),
+            'is_final': bool(is_final),
+            'utt_scores': item['utt_scores'],
+            'segments': segments,
+            'matched_ratio': matched_ratio,
+            'matched_committed_words': int(matched_committed_words),
+            'committed_lexicon_words': int(committed_lexicon_words),
+            'utt_loss_mask': utt_loss_mask,
+        })
+
+    return examples, skipped_chunks
+
+
 def build_chunk_examples(aligned_items, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, phn_dict, phone_to_frame_id):
     examples = []
     skipped_chunks = []
     for item in tqdm(aligned_items, desc='asr-chunks'):
-        utt_id = item['utt_id']
-        audio, _ = librosa.load(item['audio_path'], sr=args.sample_rate, mono=True)
-        gold_words = item['gold_words']
-        gold_word_mapping = {word['word_id']: word for word in gold_words}
-        final_time = max(item['word_end_times'].values()) if item['word_end_times'] else item['audio_duration']
-        prev_visible_words = []
-
-        for chunk_id, commit_time in enumerate(commit_schedule(final_time, args.chunk_sec)):
-            is_final = abs(commit_time - final_time) < 1e-5
-            audio_end = final_time if is_final else min(final_time, commit_time + args.right_context_sec)
-            audio_prefix = audio[: int(max(audio_end, 1e-4) * args.sample_rate)]
-            asr_words = transcribe_audio_prefix(
-                audio_prefix=audio_prefix,
-                sample_rate=args.sample_rate,
-                backend_name=asr_backend_name,
-                backend_model=asr_backend_model,
-                backend_kwargs=asr_backend_kwargs,
-                language=args.language,
-                beam_size=args.beam_size,
-                best_of=args.best_of,
-            )
-            if not asr_words:
-                skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'empty_asr_hypothesis'})
-                prev_visible_words = []
-                continue
-
-            timestamp_commit_len = sum(1 for word in asr_words if word['end'] <= commit_time + 1e-6)
-            stable_prefix_len = longest_common_prefix_len(prev_visible_words, asr_words) if prev_visible_words else timestamp_commit_len
-            committed_len = timestamp_commit_len if is_final else min(timestamp_commit_len, stable_prefix_len)
-            prev_visible_words = asr_words
-
-            asr_to_gold = lcs_align_words(asr_words, gold_words)
-            pseudo_records = []
-            matched_committed_words = 0
-            committed_lexicon_words = 0
-            visible_word_local_id = 0
-
-            for asr_idx, asr_word in enumerate(asr_words):
-                phones = lexicon.get(asr_word['text'])
-                if not phones:
-                    continue
-                committed = asr_idx < committed_len
-                if committed:
-                    committed_lexicon_words += 1
-
-                gold_idx = asr_to_gold[asr_idx]
-                gold_word = None
-                word_match = False
-                if gold_idx >= 0 and gold_words[gold_idx]['text'] == asr_word['text']:
-                    gold_word = gold_words[gold_idx]
-                    if gold_word['phones'] == phones:
-                        word_match = True
-                if committed and word_match:
-                    matched_committed_words += 1
-
-                for phone_idx, phone in enumerate(phones):
-                    if phone not in phone_to_frame_id or phone not in phn_dict:
-                        continue
-                    phone_score = -1.0
-                    word_accuracy = -1.0
-                    word_stress = -1.0
-                    word_total = -1.0
-                    loss_ok = False
-                    if word_match and gold_word is not None and phone_idx < len(gold_word['phone_scores']):
-                        phone_score = float(gold_word['phone_scores'][phone_idx])
-                        word_accuracy = float(gold_word['accuracy'])
-                        word_stress = float(gold_word['stress'])
-                        word_total = float(gold_word['total'])
-                        loss_ok = committed
-                    pseudo_records.append({
-                        'phone': phone,
-                        'phone_id': int(phn_dict[phone]),
-                        'phone_score': phone_score,
-                        'word_local_id': int(visible_word_local_id),
-                        'word_accuracy': word_accuracy,
-                        'word_stress': word_stress,
-                        'word_total': word_total,
-                        'word_match': bool(word_match),
-                        'committed': bool(committed),
-                        'word_end': float(asr_word['end']),
-                        'phone_loss_ok': bool(loss_ok),
-                        'display_word': asr_word['display_text'],
-                    })
-                visible_word_local_id += 1
-
-            if not pseudo_records:
-                skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'no_alignable_asr_phones'})
-                continue
-
-            kept_indices, kept_probs = select_visible_frames(item['probs'], item['keep_mask'], audio_end, item['frame_step'])
-            if kept_probs.shape[0] < len(pseudo_records):
-                skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'not_enough_frames_for_asr_phones'})
-                continue
-
-            try:
-                phone_ids = [phone_to_frame_id[record['phone']] for record in pseudo_records]
-                path = monotonic_align(-np.log(np.clip(kept_probs, EPS, None)), phone_ids)
-            except Exception as exc:
-                skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': f'asr_alignment_failed:{exc}'})
-                continue
-
-            segments = []
-            for tok_idx, record in enumerate(pseudo_records):
-                tok_frames = kept_indices[path == tok_idx]
-                if tok_frames.size == 0:
-                    segments = []
-                    break
-                target_id = phone_to_frame_id[record['phone']]
-                feature = segment_feature(item['probs'][tok_frames], target_id, item['frame_step'])
-                end_time = float((int(tok_frames[-1]) + 1) * item['frame_step'])
-                segments.append({
-                    'feature': feature.astype(np.float32),
-                    'phone_id': int(record['phone_id']),
-                    'phone_score': float(record['phone_score']),
-                    'word_id': int(record['word_local_id']),
-                    'word_accuracy': float(record['word_accuracy']),
-                    'word_stress': float(record['word_stress']),
-                    'word_total': float(record['word_total']),
-                    'phone_loss_mask': float(record['phone_loss_ok'] and end_time <= commit_time + 1e-6),
-                    'word_loss_mask': float(record['phone_loss_ok'] and record['word_end'] <= commit_time + 1e-6),
-                    'end_time': end_time,
-                })
-            if not segments:
-                skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'empty_asr_phone_segment'})
-                continue
-
-            matched_ratio = float(matched_committed_words) / float(max(committed_lexicon_words, 1))
-            utt_loss_mask = float(is_final and matched_ratio >= args.min_utt_match_ratio)
-            phone_loss_count = sum(segment['phone_loss_mask'] for segment in segments)
-            word_loss_count = sum(segment['word_loss_mask'] for segment in segments)
-            if phone_loss_count == 0 and word_loss_count == 0 and utt_loss_mask == 0:
-                skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': 'no_supervised_tokens_after_matching'})
-                continue
-            examples.append({
-                'utt_id': utt_id,
-                'chunk_id': int(chunk_id),
-                'audio_end': float(audio_end),
-                'commit_time': float(commit_time),
-                'is_final': bool(is_final),
-                'utt_scores': item['utt_scores'],
-                'segments': segments,
-                'matched_ratio': matched_ratio,
-                'matched_committed_words': int(matched_committed_words),
-                'committed_lexicon_words': int(committed_lexicon_words),
-                'utt_loss_mask': utt_loss_mask,
-            })
+        cur_examples, cur_skipped_chunks = build_chunk_examples_for_utterance(
+            item=item,
+            asr_backend_name=asr_backend_name,
+            asr_backend_model=asr_backend_model,
+            asr_backend_kwargs=asr_backend_kwargs,
+            args=args,
+            lexicon=lexicon,
+            phn_dict=phn_dict,
+            phone_to_frame_id=phone_to_frame_id,
+        )
+        examples.extend(cur_examples)
+        skipped_chunks.extend(cur_skipped_chunks)
     return examples, skipped_chunks
 
 
@@ -556,16 +575,118 @@ def save_chunk_split(prefix, arrays, output_dir):
             handle.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 
+def get_progress_split_dir(output_dir, split_name):
+    return output_dir / 'progress' / split_name
+
+
+def get_progress_record_path(output_dir, split_name, utt_id):
+    return get_progress_split_dir(output_dir, split_name) / f'{utt_id}.pkl'
+
+
+def save_progress_record(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp_path, 'wb') as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def load_progress_record(path):
+    with open(path, 'rb') as handle:
+        return pickle.load(handle)
+
+
+def process_split_with_resume(split_name, split_items, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, output_dir):
+    split_dir = get_progress_split_dir(output_dir, split_name)
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    processed = 0
+    resumed = 0
+    for utt_id, audio_path in tqdm(split_items, desc=f'{split_name}-resume'):
+        record_path = get_progress_record_path(output_dir, split_name, utt_id)
+        if args.resume and record_path.exists():
+            resumed += 1
+            continue
+
+        aligned = align_gold_utterance(
+            utt_id=utt_id,
+            audio_path=audio_path,
+            scores=scores,
+            charsiu=charsiu,
+            sample_rate=sample_rate,
+            device=device,
+            phone_to_frame_id=phone_to_frame_id,
+            phn_dict=phn_dict,
+        )
+        if 'skip_reason' in aligned:
+            save_progress_record(record_path, {
+                'status': 'skipped',
+                'utt_id': utt_id,
+                'skip_record': aligned,
+                'examples': [],
+                'skipped_chunks': [],
+            })
+            processed += 1
+            continue
+
+        examples, skipped_chunks = build_chunk_examples_for_utterance(
+            item=aligned,
+            asr_backend_name=asr_backend_name,
+            asr_backend_model=asr_backend_model,
+            asr_backend_kwargs=asr_backend_kwargs,
+            args=args,
+            lexicon=lexicon,
+            phn_dict=phn_dict,
+            phone_to_frame_id=phone_to_frame_id,
+        )
+        save_progress_record(record_path, {
+            'status': 'ok',
+            'utt_id': utt_id,
+            'skip_record': None,
+            'examples': examples,
+            'skipped_chunks': skipped_chunks,
+        })
+        processed += 1
+
+    examples = []
+    skipped = []
+    skipped_chunks = []
+    missing_records = []
+    for utt_id, _ in split_items:
+        record_path = get_progress_record_path(output_dir, split_name, utt_id)
+        if not record_path.exists():
+            missing_records.append(utt_id)
+            continue
+        payload = load_progress_record(record_path)
+        if payload['status'] == 'skipped':
+            skipped.append(payload['skip_record'])
+        else:
+            examples.extend(payload['examples'])
+            skipped_chunks.extend(payload['skipped_chunks'])
+
+    if missing_records:
+        raise RuntimeError(f'Missing progress records for split={split_name}: {missing_records[:5]}')
+
+    return examples, skipped, skipped_chunks, {
+        'processed_now': processed,
+        'resumed_existing': resumed,
+        'total_utterances': len(split_items),
+    }
+
+
 def main():
     args = get_args()
     dataset_root = Path(args.dataset_root)
     output_dir = Path(args.output_dir)
-    if output_dir.exists() and not args.overwrite:
-        raise FileExistsError(f'{output_dir} already exists. Use --overwrite to rebuild.')
+    if args.resume and args.overwrite:
+        raise ValueError('--resume and --overwrite are mutually exclusive.')
+    if output_dir.exists():
+        if args.overwrite:
+            shutil.rmtree(output_dir)
+        elif not args.resume and any(output_dir.iterdir()):
+            raise FileExistsError(f'{output_dir} already exists. Use --overwrite to rebuild or --resume to continue.')
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_scp = Path(args.train_scp) if args.train_scp else dataset_root / 'train' / 'wav.scp'
-    test_scp = Path(args.test_scp) if args.test_scp else dataset_root / 'test' / 'wav.scp'
     scores_path = Path(args.scores_json)
     if not scores_path.is_absolute():
         scores_path = Path.cwd() / scores_path
@@ -573,15 +694,28 @@ def main():
     with open(scores_path, 'r', encoding='utf-8') as handle:
         scores = json.load(handle)
 
-    train_items = parse_wav_scp(train_scp, dataset_root)
-    test_items = parse_wav_scp(test_scp, dataset_root)
-    utt_ids = [utt_id for utt_id, _ in train_items + test_items if utt_id in scores]
+    train_items, val_items, test_items, split_meta = resolve_dataset_splits(
+        dataset_root=dataset_root,
+        train_scp=args.train_scp,
+        val_scp=args.val_scp,
+        test_scp=args.test_scp,
+        val_ratio=args.val_speaker_ratio,
+        split_seed=args.split_seed,
+    )
+    utt_ids = [utt_id for utt_id, _ in train_items + val_items + test_items if utt_id in scores]
     phn_dict = build_phone_vocab(scores, utt_ids)
     lexicon = build_word_lexicon(scores, utt_ids)
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    aligner_processor = AutoProcessor.from_pretrained(args.aligner_model)
-    aligner_model = load_frame_model(args.aligner_model).to(device).eval()
+    charsiu = load_official_charsiu_aligner(
+        model_name=args.aligner_model,
+        device=device,
+        sample_rate=args.sample_rate,
+        sil_threshold=args.min_sil_frames,
+        lang=args.charsiu_lang,
+        charsiu_src_dir=args.charsiu_src_dir,
+    )
+    aligner_model = charsiu.aligner
     phone_to_frame_id, id2label, silence_ids = build_model_phone_map(aligner_model)
     feat_dim = int(aligner_model.config.num_labels) + 4
 
@@ -594,49 +728,76 @@ def main():
         asr_backend_kwargs = {'module': whisper_module}
         asr_backend_name = 'whisper_timestamped'
 
-    aligned_train, skipped_train = align_split(
-        train_items, scores, aligner_processor, aligner_model, args.sample_rate, device, args.min_sil_frames,
-    )
-    aligned_test, skipped_test = align_split(
-        test_items, scores, aligner_processor, aligner_model, args.sample_rate, device, args.min_sil_frames,
-    )
-
-    train_examples, skipped_train_chunks = build_chunk_examples(
-        aligned_items=aligned_train,
+    train_examples, skipped_train, skipped_train_chunks, train_progress = process_split_with_resume(
+        split_name='train',
+        split_items=train_items,
+        scores=scores,
+        charsiu=charsiu,
+        sample_rate=args.sample_rate,
+        device=device,
+        phone_to_frame_id=phone_to_frame_id,
+        phn_dict=phn_dict,
         asr_backend_name=asr_backend_name,
         asr_backend_model=asr_backend_model,
         asr_backend_kwargs=asr_backend_kwargs,
         args=args,
         lexicon=lexicon,
-        phn_dict=phn_dict,
-        phone_to_frame_id=phone_to_frame_id,
+        output_dir=output_dir,
     )
-    test_examples, skipped_test_chunks = build_chunk_examples(
-        aligned_items=aligned_test,
+    val_examples, skipped_val, skipped_val_chunks, val_progress = process_split_with_resume(
+        split_name='val',
+        split_items=val_items,
+        scores=scores,
+        charsiu=charsiu,
+        sample_rate=args.sample_rate,
+        device=device,
+        phone_to_frame_id=phone_to_frame_id,
+        phn_dict=phn_dict,
         asr_backend_name=asr_backend_name,
         asr_backend_model=asr_backend_model,
         asr_backend_kwargs=asr_backend_kwargs,
         args=args,
         lexicon=lexicon,
-        phn_dict=phn_dict,
+        output_dir=output_dir,
+    )
+    test_examples, skipped_test, skipped_test_chunks, test_progress = process_split_with_resume(
+        split_name='test',
+        split_items=test_items,
+        scores=scores,
+        charsiu=charsiu,
+        sample_rate=args.sample_rate,
+        device=device,
         phone_to_frame_id=phone_to_frame_id,
+        phn_dict=phn_dict,
+        asr_backend_name=asr_backend_name,
+        asr_backend_model=asr_backend_model,
+        asr_backend_kwargs=asr_backend_kwargs,
+        args=args,
+        lexicon=lexicon,
+        output_dir=output_dir,
     )
 
-    if not train_examples or not test_examples:
+    if not train_examples or not val_examples or not test_examples:
         raise ValueError('No ASR-driven streaming chunks were generated.')
 
-    seq_len = infer_seq_len(train_examples + test_examples)
+    seq_len = infer_seq_len(train_examples + val_examples + test_examples)
     train_norm_mean, train_norm_std = train_norm_from_examples(train_examples)
     train_arrays = build_arrays(train_examples, seq_len, feat_dim)
+    val_arrays = build_arrays(val_examples, seq_len, feat_dim)
     test_arrays = build_arrays(test_examples, seq_len, feat_dim)
 
     save_chunk_split('train', train_arrays, output_dir)
+    save_chunk_split('val', val_arrays, output_dir)
     save_chunk_split('test', test_arrays, output_dir)
 
     metadata = {
         'dataset_root': str(dataset_root),
         'scores_json': str(scores_path),
+        'split_meta': split_meta,
+        'resume_enabled': bool(args.resume),
         'aligner_model': args.aligner_model,
+        'charsiu_src_dir': args.charsiu_src_dir,
+        'charsiu_lang': args.charsiu_lang,
         'asr_model': args.asr_model,
         'timestamp_backend': args.timestamp_backend,
         'chunk_sec': float(args.chunk_sec),
@@ -652,13 +813,22 @@ def main():
         'silence_ids': [int(x) for x in silence_ids],
         'lexicon_size': int(len(lexicon)),
         'train_chunks': int(train_arrays['feat'].shape[0]),
+        'val_chunks': int(val_arrays['feat'].shape[0]),
         'test_chunks': int(test_arrays['feat'].shape[0]),
         'train_final_chunks': int(train_arrays['is_final'].sum()),
+        'val_final_chunks': int(val_arrays['is_final'].sum()),
         'test_final_chunks': int(test_arrays['is_final'].sum()),
         'skipped_train': skipped_train,
+        'skipped_val': skipped_val,
         'skipped_test': skipped_test,
         'skipped_train_chunks': skipped_train_chunks,
+        'skipped_val_chunks': skipped_val_chunks,
         'skipped_test_chunks': skipped_test_chunks,
+        'progress': {
+            'train': train_progress,
+            'val': val_progress,
+            'test': test_progress,
+        },
     }
     with open(output_dir / 'metadata.json', 'w', encoding='utf-8') as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)

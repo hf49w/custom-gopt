@@ -22,9 +22,10 @@ RSYNC_SSH="ssh -p ${SERVER_PORT}"
 
 LOCAL_DATASET_ROOT="${LOCAL_DATASET_ROOT:?LOCAL_DATASET_ROOT is required in server_paths.env}"
 LOCAL_WHISPER_BASE_MODEL_DIR="${LOCAL_WHISPER_BASE_MODEL_DIR:?LOCAL_WHISPER_BASE_MODEL_DIR is required in server_paths.env}"
+LOCAL_CHARSIU_SRC_DIR="${LOCAL_CHARSIU_SRC_DIR:-}"
 LOCAL_ALIGNER_MODEL_DIR="${LOCAL_ALIGNER_MODEL_DIR:-}"
 
-ssh -p "${SERVER_PORT}" "${SSH_TARGET}" "mkdir -p '${SERVER_DATA_ROOT}/speechocean762' '${SERVER_DATA_ROOT}/models'"
+ssh -p "${SERVER_PORT}" "${SSH_TARGET}" "mkdir -p '${SERVER_DATA_ROOT}/speechocean762' '${SERVER_DATA_ROOT}/models' '${SERVER_DATA_ROOT}/src'"
 
 rsync -avh --progress -e "${RSYNC_SSH}" \
   "${LOCAL_DATASET_ROOT}/" \
@@ -35,10 +36,19 @@ rsync -avh --progress -e "${RSYNC_SSH}" \
   "${SSH_TARGET}:${WHISPER_BASE_MODEL_DIR}/"
 
 if [[ -n "${LOCAL_ALIGNER_MODEL_DIR}" ]]; then
-  ssh -p "${SERVER_PORT}" "${SSH_TARGET}" "mkdir -p '${SERVER_DATA_ROOT}/models/charsiu'"
+  ALIGNER_BASENAME="$(basename "${LOCAL_ALIGNER_MODEL_DIR}")"
+  ssh -p "${SERVER_PORT}" "${SSH_TARGET}" "mkdir -p '${SERVER_DATA_ROOT}/models/${ALIGNER_BASENAME}'"
   rsync -avh --progress -e "${RSYNC_SSH}" \
     "${LOCAL_ALIGNER_MODEL_DIR}/" \
-    "${SSH_TARGET}:${SERVER_DATA_ROOT}/models/charsiu/"
+    "${SSH_TARGET}:${SERVER_DATA_ROOT}/models/${ALIGNER_BASENAME}/"
+fi
+
+if [[ -n "${LOCAL_CHARSIU_SRC_DIR}" ]]; then
+  CHARSIU_SRC_BASENAME="$(basename "${LOCAL_CHARSIU_SRC_DIR}")"
+  ssh -p "${SERVER_PORT}" "${SSH_TARGET}" "mkdir -p '${SERVER_DATA_ROOT}/src/${CHARSIU_SRC_BASENAME}'"
+  rsync -avh --progress -e "${RSYNC_SSH}" \
+    "${LOCAL_CHARSIU_SRC_DIR}/" \
+    "${SSH_TARGET}:${SERVER_DATA_ROOT}/src/${CHARSIU_SRC_BASENAME}/"
 fi
 
 echo "Upload completed."

@@ -23,7 +23,7 @@ def parse_int_choices(raw_value):
 
 def get_args():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--data-dir', type=str, required=True, help='Directory with train_chunks.npz / test_chunks.npz / metadata.json.')
+    parser.add_argument('--data-dir', type=str, required=True, help='Directory with train_chunks.npz / val_chunks.npz / test_chunks.npz / metadata.json.')
     parser.add_argument('--exp-dir', type=str, default='./exp_streaming_charsiu')
     parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float, metavar='LR')
     parser.add_argument('--n-epochs', type=int, default=100)
@@ -36,20 +36,22 @@ def get_args():
     parser.add_argument('--loss-w-utt', type=float, default=1.0)
     parser.add_argument('--model', type=str, default='streaming_gopt', choices=['streaming_gopt', 'streaming_gopt_nophn'])
     parser.add_argument('--noise', type=float, default=0.0)
-    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--main-context-tokens', type=str, default='8', help='Comma-separated choices, e.g. 4,8,12')
     parser.add_argument('--right-context-tokens', type=str, default='2', help='Comma-separated choices, e.g. 0,1,2,4')
+    parser.add_argument('--compile', action='store_true')
+    parser.add_argument('--tf32', action='store_true')
     parser.add_argument('--seed', type=int, default=1337)
     parser.add_argument('--resume', action='store_true', help='Resume from exp-dir/last_checkpoint.pt if it exists.')
     return parser.parse_args()
 
 
 def gen_result_header():
-    phn_header = ['epoch', 'phone_train_mse', 'phone_train_pcc', 'phone_test_mse', 'phone_test_pcc', 'learning rate']
-    utt_header_set = ['utt_train_mse', 'utt_train_pcc', 'utt_test_mse', 'utt_test_pcc']
+    phn_header = ['epoch', 'phone_train_mse', 'phone_train_pcc', 'phone_val_mse', 'phone_val_pcc', 'learning rate']
+    utt_header_set = ['utt_train_mse', 'utt_train_pcc', 'utt_val_mse', 'utt_val_pcc']
     utt_header_score = ['accuracy', 'completeness', 'fluency', 'prosodic', 'total']
-    word_header_set = ['word_train_pcc', 'word_test_pcc']
+    word_header_set = ['word_train_pcc', 'word_val_pcc']
     word_header_score = ['accuracy', 'stress', 'total']
     utt_header, word_header = [], []
     for dset in utt_header_set:
@@ -253,14 +255,15 @@ def pick_streaming_context(args):
 
 
 def model_state_dict(audio_model):
-    return audio_model.module.state_dict() if isinstance(audio_model, nn.DataParallel) else audio_model.state_dict()
+    model = audio_model.module if isinstance(audio_model, nn.DataParallel) else audio_model
+    model = getattr(model, '_orig_mod', model)
+    return model.state_dict()
 
 
 def load_model_state(audio_model, state_dict):
-    if isinstance(audio_model, nn.DataParallel):
-        audio_model.module.load_state_dict(state_dict)
-    else:
-        audio_model.load_state_dict(state_dict)
+    model = audio_model.module if isinstance(audio_model, nn.DataParallel) else audio_model
+    model = getattr(model, '_orig_mod', model)
+    model.load_state_dict(state_dict)
 
 
 def save_checkpoint(exp_dir, audio_model, optimizer, scheduler, result, epoch, global_step, best_epoch, best_mse):
@@ -301,7 +304,22 @@ def load_checkpoint(exp_dir, audio_model, optimizer, scheduler, device, args):
     )
 
 
-def train(audio_model, train_loader, train_eval_loader, test_loader, args, device):
+def make_loader(dataset, batch_size, shuffle, num_workers):
+    kwargs = {
+        'dataset': dataset,
+        'batch_size': batch_size,
+        'shuffle': shuffle,
+        'num_workers': num_workers,
+    }
+    if torch.cuda.is_available():
+        kwargs['pin_memory'] = True
+    if num_workers > 0:
+        kwargs['persistent_workers'] = True
+        kwargs['prefetch_factor'] = 4
+    return DataLoader(**kwargs)
+
+
+def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader, args, device):
     best_epoch, best_mse = 0, 999
     global_step, epoch = 0, 0
     exp_dir = Path(args.exp_dir)
@@ -310,6 +328,8 @@ def train(audio_model, train_loader, train_eval_loader, test_loader, args, devic
     if torch.cuda.device_count() > 1 and device.type == 'cuda':
         audio_model = nn.DataParallel(audio_model)
     audio_model = audio_model.to(device)
+    if args.compile and hasattr(torch, 'compile') and not isinstance(audio_model, nn.DataParallel):
+        audio_model = torch.compile(audio_model)
 
     trainables = [p for p in audio_model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainables, args.lr, weight_decay=5e-7, betas=(0.95, 0.999))
@@ -374,17 +394,17 @@ def train(audio_model, train_loader, train_eval_loader, test_loader, args, devic
         tr_mse, tr_corr, tr_utt_mse, tr_utt_corr, tr_word_mse, tr_word_corr = validate(
             audio_model, train_eval_loader, args, -1, device, eval_main_context_tokens, eval_right_context_tokens,
         )
-        te_mse, te_corr, te_utt_mse, te_utt_corr, te_word_mse, te_word_corr = validate(
-            audio_model, test_loader, args, best_mse, device, eval_main_context_tokens, eval_right_context_tokens,
+        val_mse, val_corr, val_utt_mse, val_utt_corr, val_word_mse, val_word_corr = validate(
+            audio_model, val_loader, args, best_mse, device, eval_main_context_tokens, eval_right_context_tokens,
         )
 
-        result[epoch, :6] = [epoch, tr_mse, tr_corr, te_mse, te_corr, optimizer.param_groups[0]['lr']]
-        result[epoch, 6:26] = np.concatenate([tr_utt_mse, tr_utt_corr, te_utt_mse, te_utt_corr])
-        result[epoch, 26:32] = np.concatenate([tr_word_corr, te_word_corr])
+        result[epoch, :6] = [epoch, tr_mse, tr_corr, val_mse, val_corr, optimizer.param_groups[0]['lr']]
+        result[epoch, 6:26] = np.concatenate([tr_utt_mse, tr_utt_corr, val_utt_mse, val_utt_corr])
+        result[epoch, 26:32] = np.concatenate([tr_word_corr, val_word_corr])
         np.savetxt(exp_dir / 'result.csv', result, delimiter=',', header=','.join(gen_result_header()), comments='')
 
-        if te_mse < best_mse:
-            best_mse = te_mse
+        if val_mse < best_mse:
+            best_mse = val_mse
             best_epoch = epoch
 
         if best_epoch == epoch:
@@ -396,6 +416,24 @@ def train(audio_model, train_loader, train_eval_loader, test_loader, args, devic
             scheduler.step()
         save_checkpoint(exp_dir, audio_model, optimizer, scheduler, result, epoch + 1, global_step, best_epoch, best_mse)
         epoch += 1
+
+    models_dir = exp_dir / 'models'
+    best_model_path = models_dir / 'best_audio_model.pth'
+    if best_model_path.exists():
+        load_model_state(audio_model, torch.load(best_model_path, map_location=device))
+    test_mse, test_corr, test_utt_mse, test_utt_corr, test_word_mse, test_word_corr = validate(
+        audio_model, test_loader, args, -1, device, eval_main_context_tokens, eval_right_context_tokens,
+    )
+    test_summary = {
+        'phone_test_mse': float(test_mse),
+        'phone_test_pcc': float(test_corr),
+        'utt_test_mse': [float(x) for x in test_utt_mse],
+        'utt_test_pcc': [float(x) for x in test_utt_corr],
+        'word_test_mse': [float(x) for x in test_word_mse],
+        'word_test_pcc': [float(x) for x in test_word_corr],
+        'best_epoch': int(best_epoch),
+    }
+    (exp_dir / 'test_metrics.json').write_text(json.dumps(test_summary, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def main():
@@ -410,14 +448,22 @@ def main():
     data_dir = Path(args.data_dir)
     metadata = json.loads((data_dir / 'metadata.json').read_text(encoding='utf-8'))
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+    if args.tf32 and device.type == 'cuda':
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     train_dataset = StreamingChunkDataset('train', data_dir, metadata, final_only=False)
     train_eval_dataset = StreamingChunkDataset('train', data_dir, metadata, final_only=True)
+    val_dataset = StreamingChunkDataset('val', data_dir, metadata, final_only=True)
     test_dataset = StreamingChunkDataset('test', data_dir, metadata, final_only=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    train_eval_loader = DataLoader(train_eval_dataset, batch_size=len(train_eval_dataset), shuffle=False, num_workers=args.num_workers)
-    test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=False, num_workers=args.num_workers)
+    train_loader = make_loader(train_dataset, args.batch_size, True, args.num_workers)
+    train_eval_loader = make_loader(train_eval_dataset, len(train_eval_dataset), False, args.num_workers)
+    val_loader = make_loader(val_dataset, len(val_dataset), False, args.num_workers)
+    test_loader = make_loader(test_dataset, len(test_dataset), False, args.num_workers)
 
     input_dim = int(metadata['feat_dim'])
     phn_num = int(metadata['phn_num'])
@@ -452,7 +498,7 @@ def main():
     Path(args.exp_dir).mkdir(parents=True, exist_ok=True)
     (Path(args.exp_dir) / 'config.json').write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    train(audio_model, train_loader, train_eval_loader, test_loader, args, device)
+    train(audio_model, train_loader, train_eval_loader, val_loader, test_loader, args, device)
 
 
 if __name__ == '__main__':

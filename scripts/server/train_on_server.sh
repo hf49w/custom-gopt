@@ -15,10 +15,37 @@ set -a
 source "${ENV_FILE}"
 set +a
 
-source "${VENV_DIR}/bin/activate"
+ENV_MANAGER="${ENV_MANAGER:-conda}"
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${REPO_DIR}/.conda_env}"
+VENV_DIR="${VENV_DIR:-${HOME}/venvs/custom-gopt}"
+TMPDIR="${TMPDIR:-${SERVER_DATA_ROOT}/tmp}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-${SERVER_DATA_ROOT}/pip_cache}"
+CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-${SERVER_DATA_ROOT}/conda_pkgs}"
+
+if [[ "${ENV_MANAGER}" == "conda" ]]; then
+  if [[ "${CONDA_PREFIX:-}" != "${CONDA_ENV_PREFIX}" ]]; then
+    CONDA_BASE="$(conda info --base)"
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV_PREFIX}"
+  fi
+else
+  if [[ -f "${VENV_DIR}/bin/activate" ]]; then
+    source "${VENV_DIR}/bin/activate"
+  elif [[ -n "${CONDA_PREFIX:-}" && "${CONDA_PREFIX}" == "${CONDA_ENV_PREFIX}" ]]; then
+    :
+  else
+    echo "Virtualenv not found: ${VENV_DIR}/bin/activate" >&2
+    echo "Set ENV_MANAGER=conda and CONDA_ENV_PREFIX=${CONDA_ENV_PREFIX} in ${ENV_FILE}" >&2
+    exit 1
+  fi
+fi
+
 export HF_HOME="${HF_HOME}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE}"
 export HF_HUB_CACHE="${HF_HUB_CACHE}"
+export TMPDIR="${TMPDIR}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR}"
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS}"
 
 DATA_ROOT="${SERVER_DATA_ROOT}" \
 DATASET_ROOT="${DATASET_ROOT}" \

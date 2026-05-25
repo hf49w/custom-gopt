@@ -1,22 +1,19 @@
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoProcessor
 
 from build_charsiu_seq_data import (
     EPS,
-    audio_logits,
+    align_reference_utterance,
     build_model_phone_map,
     build_reference_records,
-    build_silence_mask,
-    load_frame_model,
-    monotonic_align,
-    parse_wav_scp,
-    segment_feature,
+    load_official_charsiu_aligner,
+    resolve_dataset_splits,
 )
 
 
@@ -25,9 +22,14 @@ def get_args():
     parser.add_argument('--dataset-root', type=str, required=True, help='SpeechOcean762 root that contains train/test wav.scp and WAVE/.')
     parser.add_argument('--scores-json', type=str, default='src/prep_data/scores.json')
     parser.add_argument('--train-scp', type=str, default=None)
+    parser.add_argument('--val-scp', type=str, default=None)
     parser.add_argument('--test-scp', type=str, default=None)
+    parser.add_argument('--val-speaker-ratio', type=float, default=0.5, help='When --val-scp is not set, hold out this fraction of original test speakers for validation.')
+    parser.add_argument('--split-seed', type=int, default=1337)
     parser.add_argument('--output-dir', type=str, default='data/streaming_charsiu_tiny')
     parser.add_argument('--aligner-model', type=str, default='charsiu/en_w2v2_tiny_fc_10ms')
+    parser.add_argument('--charsiu-src-dir', type=str, default=os.environ.get('CHARSIU_SRC_DIR'))
+    parser.add_argument('--charsiu-lang', type=str, default=os.environ.get('CHARSIU_LANG', 'en'))
     parser.add_argument('--sample-rate', type=int, default=16000)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--chunk-sec', type=float, default=0.64, help='Committed audio prefix step in seconds.')
@@ -46,88 +48,7 @@ def build_phone_vocab(scores, utt_ids):
     return phn_dict
 
 
-def align_utterance(utt_id, audio_path, scores, processor, model, sample_rate, device, min_sil_frames, phone_to_frame_id, silence_ids, phn_dict):
-    if utt_id not in scores or not audio_path.exists():
-        return None
-
-    ref_records = build_reference_records(scores[utt_id])
-    ref_phones = [record['phone'] for record in ref_records]
-    missing_phone = next((phone for phone in ref_phones if phone not in phone_to_frame_id), None)
-    if missing_phone is not None:
-        return {'utt_id': utt_id, 'skip_reason': f'phone_not_in_model_vocab:{missing_phone}'}
-
-    probs, audio_duration = audio_logits(audio_path, processor, model, sample_rate, device)
-    frame_step = audio_duration / max(len(probs), 1)
-    frame_labels = np.argmax(probs, axis=-1)
-    keep_mask = build_silence_mask(frame_labels, silence_ids, min_sil_frames)
-    kept_indices = np.flatnonzero(keep_mask)
-    kept_probs = probs[keep_mask]
-
-    try:
-        phone_ids = [phone_to_frame_id[phone] for phone in ref_phones]
-        path = monotonic_align(-np.log(np.clip(kept_probs, EPS, None)), phone_ids)
-    except Exception as exc:
-        return {'utt_id': utt_id, 'skip_reason': f'alignment_failed:{exc}'}
-
-    phone_segments = []
-    word_stats = {}
-    for tok_idx, record in enumerate(ref_records):
-        tok_frames = kept_indices[path == tok_idx]
-        if tok_frames.size == 0:
-            return {'utt_id': utt_id, 'skip_reason': f'empty_phone_segment:{tok_idx}'}
-
-        target_id = phone_to_frame_id[record['phone']]
-        feature = segment_feature(probs[tok_frames], target_id, frame_step)
-        start_frame = int(tok_frames[0])
-        end_frame = int(tok_frames[-1]) + 1
-        start_time = float(start_frame * frame_step)
-        end_time = float(end_frame * frame_step)
-
-        segment = {
-            'phone': record['phone'],
-            'phone_id': int(phn_dict[record['phone']]),
-            'phone_score': float(record['phone_score']),
-            'word_id': int(record['word_id']),
-            'word_accuracy': float(record['word_accuracy']),
-            'word_stress': float(record['word_stress']),
-            'word_total': float(record['word_total']),
-            'start_time': start_time,
-            'end_time': end_time,
-            'feature': feature.astype(np.float32),
-        }
-        phone_segments.append(segment)
-
-        word_id = segment['word_id']
-        stats = word_stats.setdefault(
-            word_id,
-            {
-                'start_time': start_time,
-                'end_time': end_time,
-                'accuracy': segment['word_accuracy'],
-                'stress': segment['word_stress'],
-                'total': segment['word_total'],
-            },
-        )
-        stats['start_time'] = min(stats['start_time'], start_time)
-        stats['end_time'] = max(stats['end_time'], end_time)
-
-    return {
-        'utt_id': utt_id,
-        'audio_path': str(audio_path),
-        'audio_duration': float(audio_duration),
-        'phones': phone_segments,
-        'word_end_times': {int(word_id): float(stats['end_time']) for word_id, stats in word_stats.items()},
-        'utt_scores': {
-            'accuracy': float(scores[utt_id]['accuracy']),
-            'completeness': float(scores[utt_id]['completeness']),
-            'fluency': float(scores[utt_id]['fluency']),
-            'prosodic': float(scores[utt_id]['prosodic']),
-            'total': float(scores[utt_id]['total']),
-        },
-    }
-
-
-def align_split(split_items, scores, processor, model, sample_rate, device, min_sil_frames, phone_to_frame_id, silence_ids, phn_dict):
+def align_split(split_items, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict):
     aligned = []
     skipped = []
     for utt_id, audio_path in tqdm(split_items, desc='align'):
@@ -135,28 +56,37 @@ def align_split(split_items, scores, processor, model, sample_rate, device, min_
             utt_id=utt_id,
             audio_path=audio_path,
             scores=scores,
-            processor=processor,
-            model=model,
+            charsiu=charsiu,
             sample_rate=sample_rate,
             device=device,
-            min_sil_frames=min_sil_frames,
             phone_to_frame_id=phone_to_frame_id,
-            silence_ids=silence_ids,
             phn_dict=phn_dict,
         )
-        if result is None:
-            skipped.append({'utt_id': utt_id, 'skip_reason': 'missing_scores_or_audio'})
-        elif 'skip_reason' in result:
+        if 'skip_reason' in result:
             skipped.append(result)
         else:
             aligned.append(result)
     return aligned, skipped
 
 
-def infer_seq_len(aligned_train, aligned_test):
+def align_utterance(utt_id, audio_path, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict):
+    return align_reference_utterance(
+        utt_id=utt_id,
+        audio_path=audio_path,
+        scores=scores,
+        charsiu=charsiu,
+        sample_rate=sample_rate,
+        device=device,
+        phone_to_frame_id=phone_to_frame_id,
+        phn_dict=phn_dict,
+    )
+
+
+def infer_seq_len(*aligned_splits):
     longest = 0
-    for item in aligned_train + aligned_test:
-        longest = max(longest, len(item['phones']))
+    for split_items in aligned_splits:
+        for item in split_items:
+            longest = max(longest, len(item['phones']))
     return longest
 
 
@@ -311,8 +241,6 @@ def main():
         raise FileExistsError(f'{output_dir} already exists. Use --overwrite to rebuild.')
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_scp = Path(args.train_scp) if args.train_scp else dataset_root / 'train' / 'wav.scp'
-    test_scp = Path(args.test_scp) if args.test_scp else dataset_root / 'test' / 'wav.scp'
     scores_path = Path(args.scores_json)
     if not scores_path.is_absolute():
         scores_path = Path.cwd() / scores_path
@@ -320,36 +248,56 @@ def main():
     with open(scores_path, 'r', encoding='utf-8') as handle:
         scores = json.load(handle)
 
-    train_items = parse_wav_scp(train_scp, dataset_root)
-    test_items = parse_wav_scp(test_scp, dataset_root)
-    utt_ids = [utt_id for utt_id, _ in train_items + test_items if utt_id in scores]
+    train_items, val_items, test_items, split_meta = resolve_dataset_splits(
+        dataset_root=dataset_root,
+        train_scp=args.train_scp,
+        val_scp=args.val_scp,
+        test_scp=args.test_scp,
+        val_ratio=args.val_speaker_ratio,
+        split_seed=args.split_seed,
+    )
+    utt_ids = [utt_id for utt_id, _ in train_items + val_items + test_items if utt_id in scores]
     phn_dict = build_phone_vocab(scores, utt_ids)
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    processor = AutoProcessor.from_pretrained(args.aligner_model)
-    model = load_frame_model(args.aligner_model).to(device).eval()
-    phone_to_frame_id, id2label, silence_ids = build_model_phone_map(model)
-    feat_dim = int(model.config.num_labels) + 4
+    charsiu = load_official_charsiu_aligner(
+        model_name=args.aligner_model,
+        device=device,
+        sample_rate=args.sample_rate,
+        sil_threshold=args.min_sil_frames,
+        lang=args.charsiu_lang,
+        charsiu_src_dir=args.charsiu_src_dir,
+    )
+    phone_to_frame_id, id2label, silence_ids = build_model_phone_map(charsiu)
+    feat_dim = int(charsiu.aligner.config.num_labels) + 4
 
     aligned_train, skipped_train = align_split(
-        train_items, scores, processor, model, args.sample_rate, device, args.min_sil_frames, phone_to_frame_id, silence_ids, phn_dict,
+        train_items, scores, charsiu, args.sample_rate, device, phone_to_frame_id, phn_dict,
+    )
+    aligned_val, skipped_val = align_split(
+        val_items, scores, charsiu, args.sample_rate, device, phone_to_frame_id, phn_dict,
     )
     aligned_test, skipped_test = align_split(
-        test_items, scores, processor, model, args.sample_rate, device, args.min_sil_frames, phone_to_frame_id, silence_ids, phn_dict,
+        test_items, scores, charsiu, args.sample_rate, device, phone_to_frame_id, phn_dict,
     )
 
-    seq_len = infer_seq_len(aligned_train, aligned_test)
+    seq_len = infer_seq_len(aligned_train, aligned_val, aligned_test)
     train_norm_mean, train_norm_std = train_norm_from_aligned(aligned_train)
     train_arrays = build_chunk_arrays(aligned_train, seq_len, feat_dim, args.chunk_sec, args.right_context_sec)
+    val_arrays = build_chunk_arrays(aligned_val, seq_len, feat_dim, args.chunk_sec, args.right_context_sec)
     test_arrays = build_chunk_arrays(aligned_test, seq_len, feat_dim, args.chunk_sec, args.right_context_sec)
 
     save_chunk_split('train', train_arrays, output_dir)
+    save_chunk_split('val', val_arrays, output_dir)
     save_chunk_split('test', test_arrays, output_dir)
 
     metadata = {
         'aligner_model': args.aligner_model,
+        'charsiu_src_dir': args.charsiu_src_dir,
+        'charsiu_lang': args.charsiu_lang,
         'dataset_root': str(dataset_root),
         'scores_json': str(scores_path),
+        'split_meta': split_meta,
         'chunk_sec': float(args.chunk_sec),
         'right_context_sec': float(args.right_context_sec),
         'seq_len': int(seq_len),
@@ -358,14 +306,17 @@ def main():
         'phn_num': int(len(phn_dict) + 1),
         'train_norm_mean': float(train_norm_mean),
         'train_norm_std': float(train_norm_std),
-        'num_frame_labels': int(model.config.num_labels),
+        'num_frame_labels': int(charsiu.aligner.config.num_labels),
         'frame_id2label': {str(key): str(value) for key, value in id2label.items()},
         'silence_ids': [int(x) for x in silence_ids],
         'train_chunks': int(train_arrays['feat'].shape[0]),
+        'val_chunks': int(val_arrays['feat'].shape[0]),
         'test_chunks': int(test_arrays['feat'].shape[0]),
         'train_final_chunks': int(train_arrays['is_final'].sum()),
+        'val_final_chunks': int(val_arrays['is_final'].sum()),
         'test_final_chunks': int(test_arrays['is_final'].sum()),
         'skipped_train': skipped_train,
+        'skipped_val': skipped_val,
         'skipped_test': skipped_test,
     }
     with open(output_dir / 'metadata.json', 'w', encoding='utf-8') as handle:

@@ -1,15 +1,15 @@
 import argparse
+from collections import Counter
 import json
+import os
 from pathlib import Path
 
 import torch
-from transformers import AutoProcessor
 
 from build_charsiu_seq_data import (
-    build_model_phone_map,
     build_reference_word_records,
-    load_frame_model,
     parse_wav_scp,
+    resolve_dataset_splits,
 )
 from build_streaming_charsiu_data import align_split, commit_schedule
 
@@ -19,9 +19,14 @@ def get_args():
     parser.add_argument('--dataset-root', type=str, required=True, help='SpeechOcean762 root that contains train/test wav.scp and WAVE/.')
     parser.add_argument('--scores-json', type=str, default='src/prep_data/scores.json')
     parser.add_argument('--train-scp', type=str, default=None)
+    parser.add_argument('--val-scp', type=str, default=None)
     parser.add_argument('--test-scp', type=str, default=None)
+    parser.add_argument('--val-speaker-ratio', type=float, default=0.5, help='When --val-scp is not set, hold out this fraction of original test speakers for validation.')
+    parser.add_argument('--split-seed', type=int, default=1337)
     parser.add_argument('--output-dir', type=str, default='data/streaming_whisper_prefix')
     parser.add_argument('--aligner-model', type=str, default='charsiu/en_w2v2_tiny_fc_10ms')
+    parser.add_argument('--charsiu-src-dir', type=str, default=os.environ.get('CHARSIU_SRC_DIR'))
+    parser.add_argument('--charsiu-lang', type=str, default=os.environ.get('CHARSIU_LANG', 'en'))
     parser.add_argument('--sample-rate', type=int, default=16000)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--chunk-sec', type=float, default=0.64, help='Committed prefix step in seconds.')
@@ -85,6 +90,11 @@ def save_rows(prefix, rows, output_dir):
             handle.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 
+def summarize_skips(skipped_rows, top_k=10):
+    counts = Counter(row.get('skip_reason', 'unknown') for row in skipped_rows)
+    return [{'reason': reason, 'count': int(count)} for reason, count in counts.most_common(top_k)]
+
+
 def main():
     args = get_args()
     dataset_root = Path(args.dataset_root)
@@ -93,8 +103,6 @@ def main():
         raise FileExistsError(f'{output_dir} already exists. Use --overwrite to rebuild.')
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_scp = Path(args.train_scp) if args.train_scp else dataset_root / 'train' / 'wav.scp'
-    test_scp = Path(args.test_scp) if args.test_scp else dataset_root / 'test' / 'wav.scp'
     scores_path = Path(args.scores_json)
     if not scores_path.is_absolute():
         scores_path = Path.cwd() / scores_path
@@ -102,14 +110,17 @@ def main():
     with open(scores_path, 'r', encoding='utf-8') as handle:
         scores = json.load(handle)
 
-    train_items = parse_wav_scp(train_scp, dataset_root)
-    test_items = parse_wav_scp(test_scp, dataset_root)
-    utt_ids = [utt_id for utt_id, _ in train_items + test_items if utt_id in scores]
+    train_items, val_items, test_items, split_meta = resolve_dataset_splits(
+        dataset_root=dataset_root,
+        train_scp=args.train_scp,
+        val_scp=args.val_scp,
+        test_scp=args.test_scp,
+        val_ratio=args.val_speaker_ratio,
+        split_seed=args.split_seed,
+    )
+    utt_ids = [utt_id for utt_id, _ in train_items + val_items + test_items if utt_id in scores]
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    processor = AutoProcessor.from_pretrained(args.aligner_model)
-    model = load_frame_model(args.aligner_model).to(device).eval()
-    phone_to_frame_id, _, silence_ids = build_model_phone_map(model)
     phn_dict = {}
     for utt_id in utt_ids:
         for word in build_reference_word_records(scores[utt_id]):
@@ -117,34 +128,68 @@ def main():
                 if phone not in phn_dict:
                     phn_dict[phone] = len(phn_dict)
 
+    from build_charsiu_seq_data import load_official_charsiu_aligner, build_model_phone_map
+    charsiu = load_official_charsiu_aligner(
+        model_name=args.aligner_model,
+        device=device,
+        sample_rate=args.sample_rate,
+        sil_threshold=args.min_sil_frames,
+        lang=args.charsiu_lang,
+        charsiu_src_dir=args.charsiu_src_dir,
+    )
+    phone_to_frame_id, _, _ = build_model_phone_map(charsiu)
+
     aligned_train, skipped_train = align_split(
-        train_items, scores, processor, model, args.sample_rate, device, args.min_sil_frames, phone_to_frame_id, silence_ids, phn_dict,
+        train_items, scores, charsiu, args.sample_rate, device, phone_to_frame_id, phn_dict,
+    )
+    aligned_val, skipped_val = align_split(
+        val_items, scores, charsiu, args.sample_rate, device, phone_to_frame_id, phn_dict,
     )
     aligned_test, skipped_test = align_split(
-        test_items, scores, processor, model, args.sample_rate, device, args.min_sil_frames, phone_to_frame_id, silence_ids, phn_dict,
+        test_items, scores, charsiu, args.sample_rate, device, phone_to_frame_id, phn_dict,
     )
 
     train_rows = build_prefix_rows(aligned_train, scores, args.chunk_sec, args.right_context_sec)
+    val_rows = build_prefix_rows(aligned_val, scores, args.chunk_sec, args.right_context_sec)
     test_rows = build_prefix_rows(aligned_test, scores, args.chunk_sec, args.right_context_sec)
     save_rows('train', train_rows, output_dir)
+    save_rows('val', val_rows, output_dir)
     save_rows('test', test_rows, output_dir)
 
     metadata = {
         'dataset_root': str(dataset_root),
         'scores_json': str(scores_path),
+        'split_meta': split_meta,
         'aligner_model': args.aligner_model,
+        'charsiu_src_dir': args.charsiu_src_dir,
+        'charsiu_lang': args.charsiu_lang,
         'chunk_sec': float(args.chunk_sec),
         'right_context_sec': float(args.right_context_sec),
         'sample_rate': int(args.sample_rate),
         'train_rows': int(len(train_rows)),
+        'val_rows': int(len(val_rows)),
         'test_rows': int(len(test_rows)),
         'train_final_rows': int(sum(1 for row in train_rows if row['is_final'])),
+        'val_final_rows': int(sum(1 for row in val_rows if row['is_final'])),
         'test_final_rows': int(sum(1 for row in test_rows if row['is_final'])),
         'skipped_train': skipped_train,
+        'skipped_val': skipped_val,
         'skipped_test': skipped_test,
+        'skipped_train_summary': summarize_skips(skipped_train),
+        'skipped_val_summary': summarize_skips(skipped_val),
+        'skipped_test_summary': summarize_skips(skipped_test),
     }
     with open(output_dir / 'metadata.json', 'w', encoding='utf-8') as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    if len(train_rows) == 0 or len(val_rows) == 0 or len(test_rows) == 0:
+        raise ValueError(
+            'No Whisper prefix rows were generated. '
+            f'train_rows={len(train_rows)} val_rows={len(val_rows)} test_rows={len(test_rows)} '
+            f'train_skip_summary={metadata["skipped_train_summary"]} '
+            f'val_skip_summary={metadata["skipped_val_summary"]} '
+            f'test_skip_summary={metadata["skipped_test_summary"]}'
+        )
 
 
 if __name__ == '__main__':
