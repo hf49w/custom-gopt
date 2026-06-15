@@ -12,10 +12,11 @@ import torch.nn as nn
 import numpy as np
 
 class BaselineLSTM(nn.Module):
-    def __init__(self, embed_dim, depth, input_dim=84):
+    def __init__(self, embed_dim, depth, input_dim=84, phn_num=40):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.phn_num = phn_num
         self.lstm = torch.nn.LSTM(input_size=embed_dim, hidden_size=embed_dim, num_layers=depth, batch_first=True)
 
         # for phone classification
@@ -28,7 +29,7 @@ class BaselineLSTM(nn.Module):
         self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
 
         # phone projection
-        self.phn_proj = nn.Linear(40, embed_dim)
+        self.phn_proj = nn.Linear(self.phn_num, embed_dim)
 
         # utterance level
         self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
@@ -63,7 +64,7 @@ class BaselineLSTM(nn.Module):
         valid_tok_mask = (phn>=0)
 
         # phn_one_hot in shape [batch_size, seq_len, feat_dim]
-        phn_one_hot =  torch.nn.functional.one_hot(phn.long()+1, num_classes=40).float()
+        phn_one_hot =  torch.nn.functional.one_hot(phn.long()+1, num_classes=self.phn_num).float()
         # phn_embed in shape [batch_size, seq_len, embed_dim]
         phn_embed = self.phn_proj(phn_one_hot)
 

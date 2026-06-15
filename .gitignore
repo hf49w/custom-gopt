@@ -2,6 +2,9 @@
 __pycache__/
 **/__pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
 data/*
 data_release/*
 !data/README.md
@@ -19,3 +22,6 @@ tmp_*.sh
 figure/*
 !figure/gopt_poster.png
 colab/GOPT_old.ipynb
+exp/*
+server_assets/*
+scripts/server/server_paths.env

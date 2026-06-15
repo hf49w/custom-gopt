@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${1:-${SCRIPT_DIR}/server_paths.env}"
+STAGE="${2:-all}"
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Missing env file: ${ENV_FILE}" >&2
+  echo "Copy ${SCRIPT_DIR}/server_paths.env.example to ${SCRIPT_DIR}/server_paths.env and edit it." >&2
+  exit 1
+fi
+
+set -a
+source "${ENV_FILE}"
+set +a
+
+ENV_MANAGER="${ENV_MANAGER:-conda}"
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${REPO_DIR}/.conda_env}"
+VENV_DIR="${VENV_DIR:-${HOME}/venvs/custom-gopt}"
+TMPDIR="${TMPDIR:-${SERVER_DATA_ROOT}/tmp}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-${SERVER_DATA_ROOT}/pip_cache}"
+CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-${SERVER_DATA_ROOT}/conda_pkgs}"
+
+if [[ "${ENV_MANAGER}" == "conda" ]]; then
+  if [[ "${CONDA_PREFIX:-}" != "${CONDA_ENV_PREFIX}" ]]; then
+    CONDA_BASE="$(conda info --base)"
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV_PREFIX}"
+  fi
+else
+  if [[ -f "${VENV_DIR}/bin/activate" ]]; then
+    source "${VENV_DIR}/bin/activate"
+  elif [[ -n "${CONDA_PREFIX:-}" && "${CONDA_PREFIX}" == "${CONDA_ENV_PREFIX}" ]]; then
+    :
+  else
+    echo "Virtualenv not found: ${VENV_DIR}/bin/activate" >&2
+    echo "Set ENV_MANAGER=conda and CONDA_ENV_PREFIX=${CONDA_ENV_PREFIX} in ${ENV_FILE}" >&2
+    exit 1
+  fi
+fi
+
+export HF_HOME="${HF_HOME}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE}"
+export HF_HUB_CACHE="${HF_HUB_CACHE}"
+export TMPDIR="${TMPDIR}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR}"
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS}"
+
+DATA_ROOT="${SERVER_DATA_ROOT}" \
+DATASET_ROOT="${DATASET_ROOT}" \
+SCORES_JSON="${REPO_DIR}/src/prep_data/scores.json" \
+ALIGNER_MODEL="${ALIGNER_MODEL_DIR:-${ALIGNER_MODEL}}" \
+WHISPER_BASE_MODEL="${WHISPER_BASE_MODEL_DIR}" \
+TIMESTAMP_BACKEND="${TIMESTAMP_BACKEND}" \
+LANGUAGE="${LANGUAGE}" \
+CHUNK_SEC="${CHUNK_SEC}" \
+RIGHT_CONTEXT_SEC="${RIGHT_CONTEXT_SEC}" \
+MIN_UTT_MATCH_RATIO="${MIN_UTT_MATCH_RATIO}" \
+WHISPER_BATCH_SIZE="${WHISPER_BATCH_SIZE}" \
+WHISPER_EVAL_BATCH_SIZE="${WHISPER_EVAL_BATCH_SIZE}" \
+WHISPER_EPOCHS="${WHISPER_EPOCHS}" \
+GOPT_BATCH_SIZE="${GOPT_BATCH_SIZE}" \
+GOPT_EPOCHS="${GOPT_EPOCHS}" \
+GOPT_DEPTH="${GOPT_DEPTH}" \
+GOPT_HEADS="${GOPT_HEADS}" \
+GOPT_EMBED_DIM="${GOPT_EMBED_DIM}" \
+GOPT_MAIN_CONTEXT_TOKENS="${GOPT_MAIN_CONTEXT_TOKENS}" \
+GOPT_RIGHT_CONTEXT_TOKENS="${GOPT_RIGHT_CONTEXT_TOKENS}" \
+AUTO_RESUME=1 \
+PYTHON_BIN=python \
+"${REPO_DIR}/src/run_streaming_whisper_gopt_wsl.sh" "${STAGE}"

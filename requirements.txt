@@ -1,4 +1,10 @@
-torch==1.5.0
-kaldi-io==0.9.4
-kaldiio==2.17.2
-numpy
+torch>=2.1
+transformers>=4.37
+librosa>=0.10
+soundfile>=0.12
+tqdm>=4.66
+numpy>=1.24
+whisper-timestamped>=1.15.8
+g2p_en>=2.1
+g2pM>=0.1
+praatio>=5,<6
