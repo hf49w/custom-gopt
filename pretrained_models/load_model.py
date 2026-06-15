@@ -16,5 +16,6 @@ from models import GOPT
 gopt = GOPT(embed_dim=24, num_heads=1, depth=3, input_dim=84)
 # GOPT is trained with dataparallel, so it need to be wrapped with dataparallel even you have a single gpu or cpu
 gopt = torch.nn.DataParallel(gopt)
-sd = torch.load('/Users/yuan/Documents/gopt/pretrained_models/gopt_librispeech/best_audio_model.pth', map_location='cpu')
+model_path = os.path.join(os.path.dirname(__file__), 'gopt_librispeech', 'best_audio_model.pth')
+sd = torch.load(model_path, map_location='cpu')
 gopt.load_state_dict(sd, strict=True)

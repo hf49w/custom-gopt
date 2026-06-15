@@ -1,9 +1,13 @@
 .DS_Store
+__pycache__/
+**/__pycache__/
+*.pyc
 data/*
 data_release/*
 !data/README.md
 data.zip
 data_old/*
+downloads/*
 src/temp/*
 models/baseline.py
 src/get_summary.py
@@ -11,6 +15,7 @@ src/get_summary.py
 .idea/*
 TODO.txt
 *result_old.csv
+tmp_*.sh
 figure/*
 !figure/gopt_poster.png
 colab/GOPT_old.ipynb
