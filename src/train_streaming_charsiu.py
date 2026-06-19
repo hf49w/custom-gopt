@@ -33,6 +33,7 @@ def get_args():
     parser.add_argument('--embed-dim', type=int, default=24)
     parser.add_argument('--loss-w-phn', type=float, default=1.0)
     parser.add_argument('--loss-w-word', type=float, default=1.0)
+    parser.add_argument('--loss-w-word-asr', type=float, default=1.0)
     parser.add_argument('--loss-w-utt', type=float, default=1.0)
     parser.add_argument('--model', type=str, default='streaming_gopt', choices=['streaming_gopt', 'streaming_gopt_nophn'])
     parser.add_argument('--noise', type=float, default=0.0)
@@ -52,7 +53,7 @@ def gen_result_header():
     utt_header_set = ['utt_train_mse', 'utt_train_pcc', 'utt_val_mse', 'utt_val_pcc']
     utt_header_score = ['accuracy', 'completeness', 'fluency', 'prosodic', 'total']
     word_header_set = ['word_train_pcc', 'word_val_pcc']
-    word_header_score = ['accuracy', 'stress', 'total']
+    word_header_score = ['accuracy', 'stress', 'total', 'asr_accuracy']
     utt_header, word_header = [], []
     for dset in utt_header_set:
         utt_header = utt_header + [dset + '_' + x for x in utt_header_score]
@@ -71,6 +72,9 @@ class StreamingChunkDataset(Dataset):
         utt_label = archive['utt_label']
         phone_loss_mask = archive['phone_loss_mask']
         word_loss_mask = archive['word_loss_mask']
+        word_asr_loss_mask = archive['word_asr_loss_mask']
+        word_weight = archive['word_weight'] if 'word_weight' in archive.files else np.ones_like(word_loss_mask, dtype=np.float32)
+        word_asr_weight = archive['word_asr_weight'] if 'word_asr_weight' in archive.files else np.ones_like(word_asr_loss_mask, dtype=np.float32)
         utt_loss_mask = archive['utt_loss_mask']
         is_final = archive['is_final']
 
@@ -83,6 +87,9 @@ class StreamingChunkDataset(Dataset):
             utt_label = utt_label[keep]
             phone_loss_mask = phone_loss_mask[keep]
             word_loss_mask = word_loss_mask[keep]
+            word_asr_loss_mask = word_asr_loss_mask[keep]
+            word_weight = word_weight[keep]
+            word_asr_weight = word_asr_weight[keep]
             utt_loss_mask = utt_loss_mask[keep]
             is_final = is_final[keep]
 
@@ -94,6 +101,9 @@ class StreamingChunkDataset(Dataset):
         self.word_label[:, :, 0:3] = self.word_label[:, :, 0:3] / 5.0
         self.phone_loss_mask = torch.tensor(phone_loss_mask, dtype=torch.float32)
         self.word_loss_mask = torch.tensor(word_loss_mask, dtype=torch.float32)
+        self.word_asr_loss_mask = torch.tensor(word_asr_loss_mask, dtype=torch.float32)
+        self.word_weight = torch.tensor(word_weight, dtype=torch.float32)
+        self.word_asr_weight = torch.tensor(word_asr_weight, dtype=torch.float32)
         self.utt_loss_mask = torch.tensor(utt_loss_mask, dtype=torch.float32)
         self.is_final = torch.tensor(is_final, dtype=torch.float32)
 
@@ -114,15 +124,19 @@ class StreamingChunkDataset(Dataset):
             self.utt_label[idx],
             self.phone_loss_mask[idx],
             self.word_loss_mask[idx],
+            self.word_asr_loss_mask[idx],
+            self.word_weight[idx],
+            self.word_asr_weight[idx],
             self.utt_loss_mask[idx],
         )
 
 
-def masked_mse(pred, target, mask):
-    denom = torch.sum(mask)
+def masked_mse(pred, target, mask, weight=None):
+    effective_mask = mask if weight is None else mask * weight
+    denom = torch.sum(effective_mask)
     if denom.item() <= 0:
         return pred.new_tensor(0.0)
-    loss = ((pred - target) ** 2) * mask
+    loss = ((pred - target) ** 2) * effective_mask
     return loss.sum() / denom
 
 
@@ -147,9 +161,9 @@ def valid_utt(audio_output, target):
     return mse, corr
 
 
-def valid_word(audio_output, target, word_mask):
+def valid_word(audio_output, target, word_mask, score_slice):
     word_id = target[:, :, -1]
-    target_score = target[:, :, 0:3]
+    target_score = target[:, :, score_slice]
     valid_token_pred = []
     valid_token_target = []
 
@@ -177,7 +191,7 @@ def valid_word(audio_output, target, word_mask):
     valid_token_target = np.array(valid_token_target).round(2)
 
     mse_list, corr_list = [], []
-    for i in range(3):
+    for i in range(target_score.shape[-1]):
         mse_list.append(np.mean((valid_token_target[:, i] - valid_token_pred[:, i]) ** 2))
         corr_list.append(np.corrcoef(valid_token_pred[:, i], valid_token_target[:, i])[0, 1])
     return mse_list, corr_list, valid_token_pred, valid_token_target
@@ -187,15 +201,15 @@ def validate(audio_model, val_loader, args, best_mse, device, main_context_token
     audio_model.eval()
     A_phn, A_phn_target, A_phn_mask = [], [], []
     A_u1, A_u2, A_u3, A_u4, A_u5, A_utt_target = [], [], [], [], [], []
-    A_w1, A_w2, A_w3, A_word_target, A_word_mask = [], [], [], [], []
+    A_w1, A_w2, A_w3, A_w4, A_word_target, A_word_mask, A_word_asr_mask = [], [], [], [], [], [], []
 
     with torch.no_grad():
         for batch in val_loader:
-            audio_input, phn_label, phns, word_label, utt_label, phone_loss_mask, word_loss_mask, utt_loss_mask = batch
+            audio_input, phn_label, phns, word_label, utt_label, phone_loss_mask, word_loss_mask, word_asr_loss_mask, word_weight, word_asr_weight, utt_loss_mask = batch
             audio_input = audio_input.to(device)
             phns = phns.to(device)
 
-            u1, u2, u3, u4, u5, p, w1, w2, w3 = audio_model(
+            u1, u2, u3, u4, u5, p, w1, w2, w3, w4 = audio_model(
                 audio_input, phns, main_context_tokens=main_context_tokens, right_context_tokens=right_context_tokens,
             )
             A_phn.append(p.cpu())
@@ -210,8 +224,10 @@ def validate(audio_model, val_loader, args, best_mse, device, main_context_token
             A_w1.append(w1.cpu())
             A_w2.append(w2.cpu())
             A_w3.append(w3.cpu())
+            A_w4.append(w4.cpu())
             A_word_target.append(word_label)
             A_word_mask.append(word_loss_mask)
+            A_word_asr_mask.append(word_asr_loss_mask)
 
     A_phn = torch.cat(A_phn)
     A_phn_target = torch.cat(A_phn_target)
@@ -225,14 +241,23 @@ def validate(audio_model, val_loader, args, best_mse, device, main_context_token
     A_w1 = torch.cat(A_w1)
     A_w2 = torch.cat(A_w2)
     A_w3 = torch.cat(A_w3)
+    A_w4 = torch.cat(A_w4)
     A_word_target = torch.cat(A_word_target)
     A_word_mask = torch.cat(A_word_mask)
+    A_word_asr_mask = torch.cat(A_word_asr_mask)
 
     phn_mse, phn_corr = valid_phn(A_phn, A_phn_target, A_phn_mask)
     A_utt = torch.cat((A_u1, A_u2, A_u3, A_u4, A_u5), dim=1)
     utt_mse, utt_corr = valid_utt(A_utt, A_utt_target)
     A_word = torch.cat((A_w1, A_w2, A_w3), dim=2)
-    word_mse, word_corr, valid_word_pred, valid_word_target = valid_word(A_word, A_word_target, A_word_mask)
+    word_mse_main, word_corr_main, valid_word_pred, valid_word_target = valid_word(
+        A_word, A_word_target, A_word_mask, slice(0, 3),
+    )
+    word_asr_mse, word_asr_corr, valid_word_asr_pred, valid_word_asr_target = valid_word(
+        A_w4, A_word_target, A_word_asr_mask, slice(3, 4),
+    )
+    word_mse = word_mse_main + word_asr_mse
+    word_corr = word_corr_main + word_asr_corr
 
     if phn_mse < best_mse:
         preds_dir = Path(args.exp_dir) / 'preds'
@@ -240,9 +265,11 @@ def validate(audio_model, val_loader, args, best_mse, device, main_context_token
         if not (preds_dir / 'phn_target.npy').exists():
             np.save(preds_dir / 'phn_target.npy', A_phn_target)
             np.save(preds_dir / 'word_target.npy', valid_word_target)
+            np.save(preds_dir / 'word_asr_target.npy', valid_word_asr_target)
             np.save(preds_dir / 'utt_target.npy', A_utt_target)
         np.save(preds_dir / 'phn_pred.npy', A_phn)
         np.save(preds_dir / 'word_pred.npy', valid_word_pred)
+        np.save(preds_dir / 'word_asr_pred.npy', valid_word_asr_pred)
         np.save(preds_dir / 'utt_pred.npy', A_utt)
 
     return phn_mse, phn_corr, utt_mse, utt_corr, word_mse, word_corr
@@ -282,7 +309,7 @@ def save_checkpoint(exp_dir, audio_model, optimizer, scheduler, result, epoch, g
 
 def load_checkpoint(exp_dir, audio_model, optimizer, scheduler, device, args):
     checkpoint_path = exp_dir / 'last_checkpoint.pt'
-    empty_result = np.zeros([args.n_epochs, 32])
+    empty_result = np.zeros([args.n_epochs, len(gen_result_header())])
     if not checkpoint_path.exists():
         return 0, 0, 0, 999.0, empty_result
 
@@ -292,7 +319,8 @@ def load_checkpoint(exp_dir, audio_model, optimizer, scheduler, device, args):
     scheduler.load_state_dict(checkpoint['scheduler_state'])
 
     saved_result = checkpoint.get('result', empty_result)
-    result = np.zeros([args.n_epochs, 32])
+    metric_dim = len(gen_result_header())
+    result = np.zeros([args.n_epochs, metric_dim])
     usable_epochs = min(saved_result.shape[0], result.shape[0])
     result[:usable_epochs] = saved_result[:usable_epochs]
     return (
@@ -334,7 +362,7 @@ def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader,
     trainables = [p for p in audio_model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainables, args.lr, weight_decay=5e-7, betas=(0.95, 0.999))
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, list(range(20, 100, 5)), gamma=0.5, last_epoch=-1)
-    result = np.zeros([args.n_epochs, 32])
+    result = np.zeros([args.n_epochs, len(gen_result_header())])
 
     if args.resume:
         epoch, global_step, best_epoch, best_mse, result = load_checkpoint(
@@ -347,7 +375,7 @@ def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader,
     while epoch < args.n_epochs:
         audio_model.train()
         for batch in train_loader:
-            audio_input, phn_label, phns, word_label, utt_label, phone_loss_mask, word_loss_mask, utt_loss_mask = batch
+            audio_input, phn_label, phns, word_label, utt_label, phone_loss_mask, word_loss_mask, word_asr_loss_mask, word_weight, word_asr_weight, utt_loss_mask = batch
 
             audio_input = audio_input.to(device, non_blocking=True)
             phn_label = phn_label.to(device, non_blocking=True)
@@ -356,6 +384,9 @@ def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader,
             utt_label = utt_label.to(device, non_blocking=True)
             phone_loss_mask = phone_loss_mask.to(device, non_blocking=True)
             word_loss_mask = word_loss_mask.to(device, non_blocking=True)
+            word_asr_loss_mask = word_asr_loss_mask.to(device, non_blocking=True)
+            word_weight = word_weight.to(device, non_blocking=True)
+            word_asr_weight = word_asr_weight.to(device, non_blocking=True)
             utt_loss_mask = utt_loss_mask.to(device, non_blocking=True)
 
             warm_up_step = 100
@@ -368,7 +399,7 @@ def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader,
             audio_input = audio_input + noise
 
             main_context_tokens, right_context_tokens = pick_streaming_context(args)
-            u1, u2, u3, u4, u5, p, w1, w2, w3 = audio_model(
+            u1, u2, u3, u4, u5, p, w1, w2, w3, w4 = audio_model(
                 audio_input,
                 phns,
                 main_context_tokens=main_context_tokens,
@@ -380,12 +411,28 @@ def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader,
 
             word_pred = torch.cat((w1, w2, w3), dim=2)
             word_target = word_label[:, :, 0:3]
-            loss_word = masked_mse(word_pred, word_target, word_loss_mask.unsqueeze(-1))
+            loss_word = masked_mse(
+                word_pred,
+                word_target,
+                word_loss_mask.unsqueeze(-1),
+                word_weight.unsqueeze(-1),
+            )
+            loss_word_asr = masked_mse(
+                w4,
+                word_label[:, :, 3:4],
+                word_asr_loss_mask.unsqueeze(-1),
+                word_asr_weight.unsqueeze(-1),
+            )
 
             utt_preds = torch.cat((u1, u2, u3, u4, u5), dim=1)
             loss_utt = masked_mse(utt_preds, utt_label, utt_loss_mask.unsqueeze(-1))
 
-            loss = args.loss_w_phn * loss_phn + args.loss_w_word * loss_word + args.loss_w_utt * loss_utt
+            loss = (
+                args.loss_w_phn * loss_phn
+                + args.loss_w_word * loss_word
+                + args.loss_w_word_asr * loss_word_asr
+                + args.loss_w_utt * loss_utt
+            )
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -400,7 +447,7 @@ def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader,
 
         result[epoch, :6] = [epoch, tr_mse, tr_corr, val_mse, val_corr, optimizer.param_groups[0]['lr']]
         result[epoch, 6:26] = np.concatenate([tr_utt_mse, tr_utt_corr, val_utt_mse, val_utt_corr])
-        result[epoch, 26:32] = np.concatenate([tr_word_corr, val_word_corr])
+        result[epoch, 26:34] = np.concatenate([tr_word_corr, val_word_corr])
         np.savetxt(exp_dir / 'result.csv', result, delimiter=',', header=','.join(gen_result_header()), comments='')
 
         if val_mse < best_mse:
@@ -431,6 +478,7 @@ def train(audio_model, train_loader, train_eval_loader, val_loader, test_loader,
         'utt_test_pcc': [float(x) for x in test_utt_corr],
         'word_test_mse': [float(x) for x in test_word_mse],
         'word_test_pcc': [float(x) for x in test_word_corr],
+        'word_score_names': ['accuracy', 'stress', 'total', 'asr_accuracy'],
         'best_epoch': int(best_epoch),
     }
     (exp_dir / 'test_metrics.json').write_text(json.dumps(test_summary, ensure_ascii=False, indent=2), encoding='utf-8')

@@ -180,6 +180,101 @@ python src\train_streaming_charsiu.py `
 
 Bash commands are the same in WSL, except use `/` path separators and add `--resume` when continuing a stopped run.
 
+## PCN/N-best Streaming Data
+
+`src/prep_data/build_streaming_pcn_gopt_data.py` builds the next-generation streaming dataset without changing the existing v6 ASR-driven pipeline. It uses SpeechOcean762 GT text/phones/scores only for offline training supervision; GT is not an inference input.
+
+Example:
+
+```powershell
+python src\prep_data\build_streaming_pcn_gopt_data.py `
+  --dataset-root ..\speechocean762\speechocean762 `
+  --scores-json src\prep_data\scores.json `
+  --output-dir data\streaming_pcn_gopt `
+  --aligner-model charsiu/en_w2v2_tiny_fc_10ms `
+  --asr-model exp\streaming-whisper-base\best_model `
+  --language english `
+  --nbest 5 `
+  --beam-size 8 `
+  --chunk-sec 0.64 `
+  --right-context-sec 0.16 `
+  --overwrite
+```
+
+Main arrays in each `<split>_chunks.npz`:
+
+- `cn_post`: phone confusion-network posterior per PCN slot, with the last dimension reserved for epsilon.
+- `cn_stats`: epsilon probability, entropy, top-1 probability, top1-top2 margin, prefix stability.
+- `acoustic_post`: Charsiu frame-evidence posterior aligned to each PCN slot.
+- `acoustic_stats`: acoustic entropy, acoustic margin, duration, PCN-Charsiu JS divergence.
+- `prosody`: F0, voiced probability, log-energy, pause, rate, and articulation-rate features computed from the visible prefix.
+- `phone_target`, `word_target`, `utt_target`: SpeechOcean762 supervision labels.
+- `asr_correct_target`: whether the slot/word is supported as ASR-correct.
+- `uncertainty_target`: high when GT is absent from N-best or the CN posterior is uncertain.
+- `soft_label_weight`: 1 for exact matches, PCN posterior for approximate phone matches, 0 for mismatches or GT absent from N-best.
+- `commit_mask`, `visible_len`, `is_final`: streaming masks and chunk state.
+
+This builder calls the real Transformers `generate(..., num_return_sequences=K, output_scores=True, return_dict_in_generate=True)` path for N-best hypotheses and sequence scores. Per-hypothesis word timestamps are currently stored as duration-proportional estimates; acoustic alignment and training features rely on Charsiu frame evidence rather than those estimated timestamps.
+
+### PCN Student Training
+
+The PCN student model is `PCNStreamingScorer` in `src/models/streaming_pcn_gopt.py`. Its structure is:
+
+- Whisper N-best PCN posterior -> 16D projection.
+- Charsiu acoustic posterior -> 16D projection.
+- DSP prosody statistics -> 8D projection.
+- Reliability gate from CN entropy, acoustic entropy, PCN-Charsiu JS divergence, and prefix stability.
+- Local causal Transformer over PCN slots.
+- Online word pooling over newly committed slots.
+- Causal GRU sentence state without tail CLS tokens.
+- Heads for phone score, word scores, utterance scores, ASR correctness, uncertainty, confidence, and abstention.
+
+Train without teacher distillation:
+
+```powershell
+python src\train_streaming_pcn.py `
+  --data-dir data\streaming_pcn_gopt `
+  --exp-dir exp\streaming-pcn-gopt `
+  --embed-dim 40 `
+  --depth 2 `
+  --heads 2 `
+  --gru-dim 32 `
+  --batch-size 32 `
+  --n-epochs 80
+```
+
+### Optional MultiPA Prefix Distillation
+
+Run MultiPA on every prefix using the existing MultiPA script from `D:\研究生\智能体\MultiPA`:
+
+```bash
+cd /mnt/d/研究生/智能体/MultiPA
+python eval_multipa_prefix.py \
+  --prefix-manifest /mnt/d/研究生/智能体/gopt_charsiu/data/streaming_pcn_gopt/train_manifest.jsonl \
+  --output-jsonl /mnt/d/研究生/智能体/gopt_charsiu/data/streaming_pcn_gopt/multipa_train_prefix.jsonl \
+  --resume
+```
+
+Then inject the teacher scores into the PCN NPZ files:
+
+```powershell
+python scripts\local\inject_multipa_teacher_pcn.py `
+  --data-dir data\streaming_pcn_gopt `
+  --teacher-jsonl data\streaming_pcn_gopt\multipa_train_prefix.jsonl `
+  --splits train
+```
+
+Run the same command for `val` and `test` JSONL files when available. `inject_multipa_teacher_pcn.py` writes:
+
+- `teacher_prefix_utt_score`
+- `teacher_final_utt_score`
+- `teacher_utt_mask`
+- `teacher_utt_dim_mask`
+- `teacher_word_score`
+- `teacher_word_mask`
+
+MultiPA does not output completeness, so `teacher_utt_dim_mask[:, 1] = 0`; human labels still supervise completeness.
+
 ## Notes
 
 - This is no longer Kaldi GOP. The per-phone features are pooled Charsiu frame probabilities plus a few confidence/duration statistics.

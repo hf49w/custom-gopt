@@ -87,6 +87,30 @@ For official Charsiu mode, also set:
 - `CHARSIU_SRC_DIR` to the uploaded Charsiu repo root or its `src/` directory
 - `ALIGNER_MODEL_DIR` to the uploaded `charsiu_en_w2v2_tiny_fc_10ms` directory
 
+For lower-memory ASR-driven chunk generation, also set:
+
+- `ASR_BATCH_SIZE="4"`
+- `ASR_MIN_BATCH_SIZE="1"`
+- `ASR_MAX_NEW_TOKENS="128"`
+- `ASR_TORCH_DTYPE="auto"`
+- `ASR_USE_CACHE="0"`
+- `ASR_EMPTY_CACHE="1"`
+- `PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"`
+
+For multi-GPU server runs, also set:
+
+- `CUDA_VISIBLE_DEVICES="0,1,2,3"` to expose multiple GPUs
+- `TRAIN_DEVICE="cuda"` so training uses the visible GPUs
+- `GOPT_DATA_MULTI_GPU="1"` to shard `gopt_data` preprocessing across GPUs
+- `GOPT_DATA_GPU_IDS="0,1,2,3"` to pick the physical GPUs used by `gopt_data`
+- `GOPT_DATA_FINALIZE_DEVICE="cpu"` to aggregate shard results without occupying a GPU
+
+With these settings:
+
+- `train_streaming_whisper.py` uses `nn.DataParallel` across the visible GPUs
+- `train_streaming_charsiu.py` already uses `nn.DataParallel`
+- `build_streaming_asr_gopt_data.py` is launched as one shard worker per `GOPT_DATA_GPU_IDS` entry, then finalized once after all workers finish
+
 The preprocessing scripts import `Charsiu.charsiu_forced_aligner` from `CHARSIU_SRC_DIR` and no longer rely on a hand-built `AutoProcessor` fallback.
 
 ## 7. Server: Train

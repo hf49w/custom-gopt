@@ -123,6 +123,7 @@ class StreamingGOPT(nn.Module):
         self.mlp_head_word1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_word4 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.mlp_head_utt2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.mlp_head_utt3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
@@ -220,7 +221,8 @@ class StreamingGOPT(nn.Module):
         w1 = self.mlp_head_word1(phone_hidden)
         w2 = self.mlp_head_word2(phone_hidden)
         w3 = self.mlp_head_word3(phone_hidden)
-        return u1, u2, u3, u4, u5, p, w1, w2, w3
+        w4 = self.mlp_head_word4(phone_hidden)
+        return u1, u2, u3, u4, u5, p, w1, w2, w3, w4
 
 
 class StreamingGOPTNoPhn(StreamingGOPT):

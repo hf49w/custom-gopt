@@ -9,6 +9,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
@@ -165,10 +166,11 @@ def evaluate_generation(model, loader, processor, device, max_target_tokens):
     model.eval()
     references = []
     hypotheses = []
+    gen_model = unwrap_model(model)
     with torch.no_grad():
         for batch in tqdm(loader, desc='eval-gen', leave=False):
             input_features = batch['input_features'].to(device)
-            generated = model.generate(
+            generated = gen_model.generate(
                 input_features=input_features,
                 max_new_tokens=max_target_tokens,
             )
@@ -183,7 +185,11 @@ def evaluate_generation(model, loader, processor, device, max_target_tokens):
 
 
 def unwrap_model(model):
-    return getattr(model, '_orig_mod', model)
+    model = getattr(model, '_orig_mod', model)
+    while isinstance(model, nn.DataParallel):
+        model = model.module
+        model = getattr(model, '_orig_mod', model)
+    return model
 
 
 def save_last_model(model, processor, output_dir):
@@ -259,7 +265,9 @@ def main():
     model.config.forced_decoder_ids = forced_decoder_ids
     model.generation_config.forced_decoder_ids = forced_decoder_ids
     model.to(device)
-    if args.compile and hasattr(torch, 'compile'):
+    if torch.cuda.device_count() > 1 and device.type == 'cuda':
+        model = nn.DataParallel(model)
+    elif args.compile and hasattr(torch, 'compile'):
         model = torch.compile(model)
 
     train_dataset = PrefixDataset(data_dir / 'train_prefix.jsonl', args.sample_rate)

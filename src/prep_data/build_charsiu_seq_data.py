@@ -272,6 +272,7 @@ def import_official_charsiu_forced_align(charsiu_src_dir=None):
 def build_model_phone_map(model_or_charsiu):
     processor = None
     model = model_or_charsiu
+    charsiu_src_dir = getattr(model_or_charsiu, '_custom_charsiu_src_dir', None)
     if hasattr(model_or_charsiu, 'charsiu_processor'):
         processor = model_or_charsiu.charsiu_processor
         model = model_or_charsiu.aligner
@@ -279,8 +280,20 @@ def build_model_phone_map(model_or_charsiu):
         processor = model_or_charsiu
 
     if processor is not None:
-        vocab = processor.processor.tokenizer.get_vocab()
-        id2label = {int(idx): str(label) for label, idx in vocab.items()}
+        id2label = None
+        src_dir = resolve_charsiu_src_dir(charsiu_src_dir)
+        if src_dir is not None:
+            vocab_path = src_dir / 'vocab-ctc.json'
+            if vocab_path.exists():
+                vocab = json.loads(vocab_path.read_text(encoding='utf-8'))
+                id2label = {int(idx): str(label) for label, idx in vocab.items()}
+        if id2label is None:
+            num_labels = getattr(getattr(model, 'config', None), 'num_labels', None)
+            if num_labels is not None:
+                id2label = {int(idx): str(processor.mapping_id2phone(int(idx))) for idx in range(int(num_labels))}
+            else:
+                vocab = processor.processor.tokenizer.get_vocab()
+                id2label = {int(idx): str(label) for label, idx in vocab.items()}
     else:
         id2label = getattr(model.config, 'id2label', {}) or {}
 

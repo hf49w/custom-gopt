@@ -8,3 +8,4 @@
 from .gopt import *
 from .baseline import *
 from .streaming_gopt import *
+from .streaming_pcn_gopt import *
