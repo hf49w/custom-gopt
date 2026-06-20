@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 
-import math
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .streaming_gopt import Mlp, StreamingBlock, trunc_normal_
+from .streaming_gopt import StreamingBlock, trunc_normal_
 
 
 def masked_mean(values, mask, dim, keepdim=False):
@@ -43,17 +40,11 @@ class ReliabilityGate(nn.Module):
 
 class PCNStreamingScorer(nn.Module):
     """
-    Lightweight stateful streaming scorer for PCN/Charsiu/prosody features.
+    Stateful streaming scorer for streaming_pcn_gopt_v2_stateful.
 
-    Inputs follow streaming_pcn_gopt_v1:
-    - cn_post: [B, T, phone_dim]
-    - cn_stats: [B, T, 5]
-    - acoustic_post: [B, T, phone_dim]
-    - acoustic_stats: [B, T, 4]
-    - prosody: [B, prosody_dim]
-    - visible_len: [B]
-    - commit_mask: [B, T]
-    - word_ids: [B, T], optional, used for online word pooling
+    Local phone/word heads read all visible PCN slots. The sentence GRU is
+    updated only from slots selected by new_commit_mask. cumulative_commit_mask
+    is retained for losses/diagnostics and must not be used for GRU updates.
     """
 
     def __init__(
@@ -70,6 +61,8 @@ class PCNStreamingScorer(nn.Module):
         gru_dim=32,
         main_context_tokens=16,
         dropout=0.0,
+        use_state_projection=False,
+        teacher_state_dim=128,
     ):
         super().__init__()
         self.phone_dim = int(phone_dim)
@@ -78,6 +71,10 @@ class PCNStreamingScorer(nn.Module):
         self.embed_dim = int(embed_dim)
         self.gru_dim = int(gru_dim)
         self.main_context_tokens = max(int(main_context_tokens), 1)
+        self.use_state_projection = bool(use_state_projection)
+
+        if pcn_embed_dim != acoustic_embed_dim:
+            raise ValueError('pcn_embed_dim and acoustic_embed_dim must match for gated interpolation.')
 
         self.pcn_proj = nn.Sequential(
             nn.Linear(self.phone_dim + 5, pcn_embed_dim),
@@ -95,12 +92,9 @@ class PCNStreamingScorer(nn.Module):
             nn.Linear(max(16, prosody_embed_dim * 2), prosody_embed_dim),
             nn.LayerNorm(prosody_embed_dim),
         )
-        if pcn_embed_dim != acoustic_embed_dim:
-            raise ValueError('pcn_embed_dim and acoustic_embed_dim must match for gated interpolation.')
-        fused_dim = pcn_embed_dim + prosody_embed_dim
         self.reliability_gate = ReliabilityGate()
         self.fused_proj = nn.Sequential(
-            nn.Linear(fused_dim, embed_dim),
+            nn.Linear(pcn_embed_dim + prosody_embed_dim, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.Dropout(dropout),
         )
@@ -130,7 +124,11 @@ class PCNStreamingScorer(nn.Module):
         self.confidence_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.abstention_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.utt_head = nn.Sequential(nn.LayerNorm(gru_dim), nn.Linear(gru_dim, 5))
-        self.state_projection = nn.Sequential(nn.LayerNorm(gru_dim), nn.Linear(gru_dim, 128))
+        self.state_projection = (
+            nn.Sequential(nn.LayerNorm(gru_dim), nn.Linear(gru_dim, int(teacher_state_dim)))
+            if self.use_state_projection
+            else None
+        )
 
     def build_local_causal_mask(self, valid_mask):
         batch_size, seq_len = valid_mask.shape
@@ -150,7 +148,6 @@ class PCNStreamingScorer(nn.Module):
         z_acoustic = self.acoustic_proj(torch.cat([acoustic_post, acoustic_stats], dim=-1))
         z_prosody = self.prosody_proj(prosody).unsqueeze(1).expand(-1, cn_post.shape[1], -1)
         gate = self.reliability_gate(cn_stats, acoustic_stats)
-        # gate=1 trusts Charsiu acoustic evidence; gate=0 trusts PCN posterior.
         evidence = gate * z_acoustic + (1.0 - gate) * z_pcn
         token = self.fused_proj(torch.cat([evidence, z_prosody], dim=-1))
         token = token + self.pos_embed[:, : token.shape[1]]
@@ -164,14 +161,12 @@ class PCNStreamingScorer(nn.Module):
             hidden = block(hidden, attn_mask)
         return hidden * valid_mask.unsqueeze(-1).to(hidden.dtype)
 
-    def pool_committed_words(self, hidden, commit_mask, word_ids=None):
-        batch_size, seq_len, dim = hidden.shape
-        pooled_rows = []
-        pooled_masks = []
-        max_words = 0
+    def pool_new_committed_words(self, hidden, new_commit_mask, word_ids=None):
+        batch_size, _, dim = hidden.shape
         row_groups = []
+        max_words = 0
         for row in range(batch_size):
-            active = torch.nonzero(commit_mask[row] > 0, as_tuple=False).squeeze(1).tolist()
+            active = torch.nonzero(new_commit_mask[row] > 0, as_tuple=False).squeeze(1).tolist()
             groups = []
             if active:
                 if word_ids is None:
@@ -192,6 +187,8 @@ class PCNStreamingScorer(nn.Module):
             max_words = max(max_words, len(groups))
 
         max_words = max(max_words, 1)
+        pooled_rows = []
+        pooled_masks = []
         for row, groups in enumerate(row_groups):
             pooled = hidden.new_zeros(max_words, dim)
             mask = hidden.new_zeros(max_words)
@@ -203,20 +200,21 @@ class PCNStreamingScorer(nn.Module):
             pooled_masks.append(mask)
         return torch.stack(pooled_rows, dim=0), torch.stack(pooled_masks, dim=0)
 
-    def update_sentence_state(self, committed_words, word_mask, prev_state):
-        batch_size = committed_words.shape[0]
+    def update_sentence_state(self, new_words, word_mask, prev_state):
+        batch_size = new_words.shape[0]
+        if prev_state is not None and prev_state.dim() == 2:
+            prev_state = prev_state.unsqueeze(0)
         states = []
         for row in range(batch_size):
-            h0 = (
-                prev_state[:, row : row + 1, :]
-                if prev_state is not None
-                else committed_words.new_zeros(1, 1, self.gru_dim)
-            )
+            if prev_state is None:
+                h0 = new_words.new_zeros(1, 1, self.gru_dim)
+            else:
+                h0 = prev_state[:, row : row + 1, :]
             word_count = int(word_mask[row].sum().item())
             if word_count <= 0:
                 states.append(h0)
                 continue
-            _, h_row = self.sentence_gru(committed_words[row : row + 1, :word_count], h0)
+            _, h_row = self.sentence_gru(new_words[row : row + 1, :word_count], h0)
             states.append(h_row)
         return torch.cat(states, dim=1)
 
@@ -228,49 +226,61 @@ class PCNStreamingScorer(nn.Module):
         acoustic_stats,
         prosody,
         visible_len,
-        commit_mask,
+        cumulative_commit_mask=None,
+        new_commit_mask=None,
+        commit_mask=None,
         word_ids=None,
         prev_state=None,
+        detach_next_state=False,
     ):
         batch_size, seq_len, _ = cn_post.shape
         device = cn_post.device
         token_idx = torch.arange(seq_len, device=device).unsqueeze(0)
         valid_mask = token_idx < visible_len.to(device).unsqueeze(1)
-        commit_mask = (commit_mask > 0) & valid_mask
+
+        if cumulative_commit_mask is None:
+            cumulative_commit_mask = commit_mask
+        if cumulative_commit_mask is None:
+            cumulative_commit_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+        if new_commit_mask is None:
+            # Legacy fallback: safe only for stateless/full-sentence use.
+            new_commit_mask = cumulative_commit_mask
+        cumulative_commit_mask = (cumulative_commit_mask > 0) & valid_mask
+        new_commit_mask = (new_commit_mask > 0) & valid_mask
 
         token, gate = self.encode_slots(cn_post, cn_stats, acoustic_post, acoustic_stats, prosody, valid_mask)
         slot_hidden = self.local_causal_transformer(token, valid_mask)
-        committed_words, word_mask = self.pool_committed_words(slot_hidden, commit_mask, word_ids=word_ids)
-
-        if prev_state is not None and prev_state.dim() == 2:
-            prev_state = prev_state.unsqueeze(0)
-        final_state = self.update_sentence_state(committed_words, word_mask, prev_state)
+        new_words, new_word_mask = self.pool_new_committed_words(slot_hidden, new_commit_mask, word_ids=word_ids)
+        final_state = self.update_sentence_state(new_words, new_word_mask, prev_state)
+        next_state = final_state.detach() if detach_next_state else final_state
         sentence_state = final_state[-1]
 
-        phone_score = self.phone_head(slot_hidden)
-        word_scores = self.word_head(slot_hidden)
-        asr_correct_logits = self.asr_correct_head(slot_hidden)
-        uncertainty_logits = self.uncertainty_head(slot_hidden)
-        confidence = torch.sigmoid(self.confidence_head(slot_hidden))
+        confidence_logit = self.confidence_head(slot_hidden)
         abstention_logit = self.abstention_head(slot_hidden)
-        utt_scores = self.utt_head(sentence_state)
-
-        return {
-            'phone_score': phone_score,
-            'word_scores': word_scores,
-            'utt_scores': utt_scores,
-            'asr_correct_logits': asr_correct_logits,
-            'uncertainty_logits': uncertainty_logits,
-            'confidence': confidence,
+        output = {
+            'phone_score': self.phone_head(slot_hidden),
+            'word_scores': self.word_head(slot_hidden),
+            'utt_scores': self.utt_head(sentence_state),
+            'asr_correct_logits': self.asr_correct_head(slot_hidden),
+            'uncertainty_logits': self.uncertainty_head(slot_hidden),
+            'confidence_logit': confidence_logit,
+            'confidence': torch.sigmoid(confidence_logit),
             'abstention_logit': abstention_logit,
+            'abstention_probability': torch.sigmoid(abstention_logit),
             'reliability_gate': gate,
             'slot_hidden': slot_hidden,
-            'word_states': committed_words,
-            'word_mask': word_mask,
+            'new_word_states': new_words,
+            'new_word_mask': new_word_mask,
+            'word_states': new_words,
+            'word_mask': new_word_mask,
             'sentence_state': sentence_state,
-            'state_projection': self.state_projection(sentence_state),
-            'next_state': final_state.detach(),
+            'next_state': next_state,
+            'cumulative_commit_mask': cumulative_commit_mask,
+            'new_commit_mask': new_commit_mask,
         }
+        if self.state_projection is not None:
+            output['state_projection'] = self.state_projection(sentence_state)
+        return output
 
     @torch.inference_mode()
     def stream_step(self, batch, prev_state=None):
@@ -281,7 +291,9 @@ class PCNStreamingScorer(nn.Module):
             acoustic_stats=batch['acoustic_stats'],
             prosody=batch['prosody'],
             visible_len=batch['visible_len'],
-            commit_mask=batch['commit_mask'],
+            cumulative_commit_mask=batch.get('cumulative_commit_mask', batch.get('commit_mask')),
+            new_commit_mask=batch.get('new_commit_mask'),
             word_ids=batch.get('pcn_word_id'),
             prev_state=prev_state,
+            detach_next_state=True,
         )

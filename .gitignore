@@ -25,3 +25,20 @@ colab/GOPT_old.ipynb
 exp/*
 server_assets/*
 scripts/server/server_paths.env
+# model weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# common model dirs
+hf_bundle/**/checkpoint*/
+hf_bundle/**/whisper_best_model/
+hf_bundle/**/charsiu_en_w2v2_tiny_fc_10ms/
+
+# caches / logs
+__pycache__/
+*.pyc
+*.log

@@ -35,6 +35,8 @@ from build_streaming_charsiu_data import commit_schedule
 
 
 EPS_TOKEN = '<eps>'
+PCN_SCHEMA = 'streaming_pcn_gopt_v2_stateful'
+PCN_TYPE = 'nbest_derived_phone_confusion_network'
 
 
 def get_args():
@@ -236,26 +238,120 @@ class WhisperNBestGenerator:
         if self.forced_decoder_ids is not None:
             generate_kwargs['forced_decoder_ids'] = self.forced_decoder_ids
         output = self.model.generate(**inputs, **generate_kwargs)
-        texts = self.processor.batch_decode(output.sequences, skip_special_tokens=True)
+        sequences = output.sequences
+        texts = self.processor.batch_decode(sequences, skip_special_tokens=True)
         if getattr(output, 'sequences_scores', None) is not None:
-            logprobs = output.sequences_scores.detach().float().cpu().numpy().tolist()
+            sequence_scores = output.sequences_scores.detach().float().cpu().numpy().tolist()
         else:
-            logprobs = [0.0 for _ in texts]
+            sequence_scores = [0.0 for _ in texts]
+        transition_scores = self._transition_scores(output)
 
         rows = []
-        for rank, (text, logprob) in enumerate(zip(texts, logprobs)):
-            words = normalize_text_to_words(text)
+        for rank, (text, sequence_score) in enumerate(zip(texts, sequence_scores)):
+            token_ids = sequences[rank].detach().cpu().tolist()
+            token_logprobs = transition_scores[rank] if rank < len(transition_scores) else [float(sequence_score)]
+            token_rows, word_rows = self._token_word_scores(token_ids, token_logprobs)
+            words = [row['word'] for row in word_rows]
+            length_norm = (
+                float(np.mean([row['logprob'] for row in token_rows]))
+                if token_rows
+                else float(sequence_score)
+            )
             rows.append({
                 'rank': int(rank),
                 'text': ' '.join(words).lower(),
                 'words': words,
-                'logprob': float(logprob),
+                'logprob': float(length_norm),
+                'sequence_score': float(sequence_score),
+                'length_normalized_sequence_score': float(length_norm),
+                'token_ids': [int(row['token_id']) for row in token_rows],
+                'token_logprobs': [float(row['logprob']) for row in token_rows],
+                'token_confidences': [float(row['confidence']) for row in token_rows],
+                'word_token_ranges': [[int(row['token_start']), int(row['token_end'])] for row in word_rows],
+                'word_logprobs': [float(row['logprob']) for row in word_rows],
+                'word_confidences': [float(row['confidence']) for row in word_rows],
                 'word_timestamps': estimate_word_timestamps(words, audio_end),
             })
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
         return rows
+
+    def _transition_scores(self, output):
+        if not hasattr(self.model, 'compute_transition_scores') or getattr(output, 'scores', None) is None:
+            return []
+        try:
+            scores = self.model.compute_transition_scores(
+                output.sequences,
+                output.scores,
+                getattr(output, 'beam_indices', None),
+                normalize_logits=True,
+            )
+            return scores.detach().float().cpu().numpy().tolist()
+        except Exception:
+            return []
+
+    def _token_word_scores(self, token_ids, token_logprobs):
+        tokenizer = self.processor.tokenizer
+        special_ids = set(getattr(tokenizer, 'all_special_ids', []) or [])
+        if len(token_logprobs) != len(token_ids):
+            aligned = [0.0 for _ in token_ids]
+            offset = max(0, len(token_ids) - len(token_logprobs))
+            for idx, value in enumerate(token_logprobs[-len(token_ids) :]):
+                pos = offset + idx
+                if pos < len(aligned):
+                    aligned[pos] = float(value)
+            token_logprobs = aligned
+        token_rows = []
+        words = []
+        current = []
+        current_token_ids = []
+        current_logprobs = []
+        current_start = None
+
+        def flush():
+            nonlocal current, current_token_ids, current_logprobs, current_start
+            word = normalize_word(''.join(current))
+            if word:
+                avg_logprob = float(np.mean(current_logprobs)) if current_logprobs else 0.0
+                words.append({
+                    'word': word,
+                    'token_start': int(current_start if current_start is not None else 0),
+                    'token_end': int((current_token_ids[-1] + 1) if current_token_ids else 0),
+                    'logprob': avg_logprob,
+                    'confidence': float(np.clip(np.exp(avg_logprob), 0.0, 1.0)),
+                })
+            current = []
+            current_token_ids = []
+            current_logprobs = []
+            current_start = None
+
+        for pos, token_id in enumerate(token_ids):
+            if int(token_id) in special_ids:
+                continue
+            logprob = float(token_logprobs[pos]) if pos < len(token_logprobs) else 0.0
+            try:
+                text = tokenizer.decode([int(token_id)], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            except TypeError:
+                text = tokenizer.decode([int(token_id)], skip_special_tokens=True)
+            if not text:
+                continue
+            token_rows.append({
+                'token_id': int(token_id),
+                'logprob': logprob,
+                'confidence': float(np.clip(np.exp(logprob), 0.0, 1.0)),
+            })
+            for char in text:
+                if char.isalpha() or char == "'":
+                    if current_start is None:
+                        current_start = pos
+                    current.append(char)
+                    current_token_ids.append(pos)
+                    current_logprobs.append(logprob)
+                else:
+                    flush()
+        flush()
+        return token_rows, words
 
 
 def normalize_text_to_words(text):
@@ -282,7 +378,128 @@ def estimate_word_timestamps(words, audio_end):
     return rows
 
 
-def align_token_sequences(ref_tokens, hyp_tokens, mismatch_cost=1.0):
+def hypothesis_phone_rows(row, phone_mapper, phn_dict):
+    phones = []
+    phone_ids = []
+    phone_to_word = []
+    phone_confidences = []
+    source_counts = Counter()
+    word_confidences = row.get('word_confidences') or [1.0 for _ in row.get('words', [])]
+    for word_idx, word in enumerate(row.get('words', [])):
+        cur_phones, source = phone_mapper.word_to_phones(word)
+        source_counts[source] += 1
+        word_conf = float(word_confidences[word_idx]) if word_idx < len(word_confidences) else 1.0
+        word_conf = float(np.clip(word_conf, 0.0, 1.0))
+        for phone in cur_phones:
+            if phone not in phn_dict:
+                continue
+            phones.append(phone)
+            phone_ids.append(int(phn_dict[phone]))
+            phone_to_word.append(int(word_idx))
+            phone_confidences.append(word_conf)
+    return {
+        'phones': phones,
+        'phone_ids': phone_ids,
+        'phone_to_word': phone_to_word,
+        'phone_confidences': phone_confidences,
+        'source_counts': dict(source_counts),
+    }
+
+
+def align_hypothesis_with_charsiu(item, row, phone_mapper, phn_dict, phone_to_frame_id, audio_end):
+    hyp = hypothesis_phone_rows(row, phone_mapper, phn_dict)
+    words = row.get('words', [])
+    if not words or not hyp['phone_ids']:
+        row['word_timestamps'] = []
+        row['timestamp_source'] = 'empty_hypothesis'
+        row['phone_times'] = []
+        row['phone_acoustic_supports'] = []
+        return row
+
+    kept_indices, kept_probs = select_visible_frames(item['probs'], item['keep_mask'], audio_end, item['frame_step'])
+    frame_phone_ids = []
+    id_to_phone = {idx: phone for phone, idx in phn_dict.items()}
+    try:
+        for phone_idx in hyp['phone_ids']:
+            phone = id_to_phone[int(phone_idx)]
+            frame_phone_ids.append(phone_to_frame_id[phone])
+        if kept_probs.shape[0] < len(frame_phone_ids):
+            raise ValueError('not_enough_visible_frames_for_hypothesis')
+        path = monotonic_align(-np.log(np.clip(kept_probs, EPS, None)), frame_phone_ids)
+        phone_times = []
+        phone_acoustic_supports = []
+        for phone_pos, frame_phone_id in enumerate(frame_phone_ids):
+            local_frames = kept_indices[path == phone_pos]
+            if local_frames.size == 0:
+                raise ValueError('empty_aligned_phone_span')
+            start_time = float(local_frames.min() * item['frame_step'])
+            end_time = float((local_frames.max() + 1) * item['frame_step'])
+            support = float(np.mean(item['probs'][local_frames, frame_phone_id]))
+            phone_times.append((start_time, min(float(audio_end), end_time)))
+            phone_acoustic_supports.append(float(np.clip(support, 0.0, 1.0)))
+        word_rows = []
+        for word_idx, word in enumerate(words):
+            positions = [idx for idx, cur_word in enumerate(hyp['phone_to_word']) if cur_word == word_idx]
+            if not positions:
+                continue
+            start = min(phone_times[idx][0] for idx in positions)
+            end = max(phone_times[idx][1] for idx in positions)
+            word_rows.append({
+                'word': word,
+                'start': float(start),
+                'end': float(end),
+                'source': 'charsiu_hypothesis_alignment',
+                'word_logprob': float(row.get('word_logprobs', [0.0] * len(words))[word_idx])
+                if word_idx < len(row.get('word_logprobs', []))
+                else 0.0,
+                'word_confidence': float(row.get('word_confidences', [1.0] * len(words))[word_idx])
+                if word_idx < len(row.get('word_confidences', []))
+                else 1.0,
+            })
+        row['word_timestamps'] = word_rows
+        row['timestamp_source'] = 'charsiu_hypothesis_alignment'
+        row['phone_times'] = phone_times
+        row['phone_acoustic_supports'] = phone_acoustic_supports
+    except Exception as exc:
+        row['word_timestamps'] = estimate_word_timestamps(words, audio_end)
+        row['timestamp_source'] = 'duration_proportional_fallback'
+        row['timestamp_fallback_reason'] = repr(exc)
+        phone_times = []
+        phone_acoustic_supports = []
+        for phone_idx, word_idx in enumerate(hyp['phone_to_word']):
+            if word_idx < len(row['word_timestamps']):
+                word_time = row['word_timestamps'][word_idx]
+                phone_times.append((float(word_time['start']), float(word_time['end'])))
+            else:
+                phone_times.append((0.0, float(audio_end)))
+            phone_acoustic_supports.append(0.0)
+        row['phone_times'] = phone_times
+        row['phone_acoustic_supports'] = phone_acoustic_supports
+    row.update(hyp)
+    return row
+
+
+def interval_overlap_ratio(a, b):
+    if a is None or b is None:
+        return 0.0
+    a0, a1 = a
+    b0, b1 = b
+    inter = max(0.0, min(float(a1), float(b1)) - max(float(a0), float(b0)))
+    union = max(float(a1), float(b1)) - min(float(a0), float(b0))
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def align_token_sequences(
+    ref_tokens,
+    hyp_tokens,
+    mismatch_cost=1.0,
+    ref_times=None,
+    hyp_times=None,
+    hyp_confidences=None,
+    time_overlap_reward=0.0,
+):
     n = len(ref_tokens)
     m = len(hyp_tokens)
     dp = np.zeros((n + 1, m + 1), dtype=np.float32)
@@ -296,6 +513,11 @@ def align_token_sequences(ref_tokens, hyp_tokens, mismatch_cost=1.0):
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             sub_cost = 0.0 if ref_tokens[i - 1] == hyp_tokens[j - 1] else mismatch_cost
+            if ref_times is not None and hyp_times is not None:
+                sub_cost -= float(time_overlap_reward) * interval_overlap_ratio(ref_times[i - 1], hyp_times[j - 1])
+            if hyp_confidences is not None:
+                sub_cost -= 0.1 * float(np.clip(hyp_confidences[j - 1], 0.0, 1.0))
+            sub_cost = max(0.0, sub_cost)
             candidates = [
                 (dp[i - 1, j - 1] + sub_cost, i - 1, j - 1, 'match'),
                 (dp[i - 1, j] + 1.0, i - 1, j, 'delete'),
@@ -332,8 +554,28 @@ def slot_top_phone(slot_counts, eps_index):
     return best_idx
 
 
+def slot_time(slot):
+    mass = max(float(slot.get('time_mass', 0.0)), EPS)
+    if mass <= EPS:
+        return None
+    return float(slot.get('start_sum', 0.0) / mass), float(slot.get('end_sum', 0.0) / mass)
+
+
+def add_slot_phone_mass(slot, phone_idx, phone_mass, eps_index, eps_mass=0.0, phone_time=None, confidence=1.0):
+    if phone_mass > 0:
+        slot['counts'][int(phone_idx)] += float(phone_mass)
+    if eps_mass > 0:
+        slot['counts'][eps_index] += float(eps_mass)
+    if phone_time is not None and phone_mass > 0:
+        slot['start_sum'] = slot.get('start_sum', 0.0) + float(phone_time[0]) * float(phone_mass)
+        slot['end_sum'] = slot.get('end_sum', 0.0) + float(phone_time[1]) * float(phone_mass)
+        slot['time_mass'] = slot.get('time_mass', 0.0) + float(phone_mass)
+    slot['confidence_sum'] = slot.get('confidence_sum', 0.0) + float(confidence) * max(float(phone_mass), 0.0)
+    slot['confidence_mass'] = slot.get('confidence_mass', 0.0) + max(float(phone_mass), 0.0)
+
+
 def insert_slot(slots, insert_at, eps_index, prior_mass):
-    slot = {'counts': Counter()}
+    slot = {'counts': Counter(), 'start_sum': 0.0, 'end_sum': 0.0, 'time_mass': 0.0}
     if prior_mass > 0:
         slot['counts'][eps_index] += float(prior_mass)
     slots.insert(insert_at, slot)
@@ -343,20 +585,34 @@ def insert_slot(slots, insert_at, eps_index, prior_mass):
 def build_pcn_from_hypotheses(hypotheses, phone_mapper, phn_dict):
     eps_index = len(phn_dict)
     phone_dim = len(phn_dict) + 1
-    hyp_logprobs = [float(row['logprob']) for row in hypotheses]
+    hyp_logprobs = [float(row.get('length_normalized_sequence_score', row.get('logprob', 0.0))) for row in hypotheses]
     hyp_weights = softmax_1d(hyp_logprobs)
     id_to_phone = {idx: phone for phone, idx in phn_dict.items()}
 
     hyp_phone_rows = []
     for row, weight in zip(hypotheses, hyp_weights):
-        phones, phone_to_word, source_counts = phone_mapper.words_to_phone_sequence(row['words'])
-        phone_ids = [phn_dict[phone] for phone in phones if phone in phn_dict]
+        if 'phone_ids' not in row:
+            row = align_hypothesis_with_charsiu(
+                item={'probs': np.zeros((0, phone_dim), dtype=np.float32), 'keep_mask': np.zeros((0,), dtype=np.int32), 'frame_step': 0.02},
+                row=row,
+                phone_mapper=phone_mapper,
+                phn_dict=phn_dict,
+                phone_to_frame_id={},
+                audio_end=0.0,
+            )
+        phone_ids = [int(phone_idx) for phone_idx in row.get('phone_ids', [])]
+        phone_confidences = [float(x) for x in row.get('phone_confidences', [1.0] * len(phone_ids))]
+        phone_acoustic = [float(x) for x in row.get('phone_acoustic_supports', [0.0] * len(phone_ids))]
+        phone_times = row.get('phone_times', [None] * len(phone_ids))
         hyp_phone_rows.append({
-            'phones': phones,
+            'phones': row.get('phones', []),
             'phone_ids': phone_ids,
-            'phone_to_word': phone_to_word,
+            'phone_to_word': list(row.get('phone_to_word', [])),
+            'phone_confidences': phone_confidences,
+            'phone_acoustic_supports': phone_acoustic,
+            'phone_times': phone_times,
             'weight': float(weight),
-            'source_counts': source_counts,
+            'source_counts': row.get('source_counts', {}),
         })
 
     slots = []
@@ -365,9 +621,22 @@ def build_pcn_from_hypotheses(hypotheses, phone_mapper, phn_dict):
         phone_ids = hyp['phone_ids']
         weight = float(hyp['weight'])
         if hyp_idx == 0:
-            for phone_idx in phone_ids:
-                slot = {'counts': Counter()}
-                slot['counts'][phone_idx] += weight
+            for local_idx, phone_idx in enumerate(phone_ids):
+                slot = {'counts': Counter(), 'start_sum': 0.0, 'end_sum': 0.0, 'time_mass': 0.0}
+                quality = float(np.clip(
+                    0.5 * hyp['phone_confidences'][local_idx] + 0.5 * hyp['phone_acoustic_supports'][local_idx],
+                    0.0,
+                    1.0,
+                ))
+                add_slot_phone_mass(
+                    slot,
+                    phone_idx,
+                    weight * quality,
+                    eps_index,
+                    eps_mass=weight * (1.0 - quality),
+                    phone_time=hyp['phone_times'][local_idx] if local_idx < len(hyp['phone_times']) else None,
+                    confidence=hyp['phone_confidences'][local_idx],
+                )
                 slots.append(slot)
             total_mass += weight
             continue
@@ -379,14 +648,35 @@ def build_pcn_from_hypotheses(hypotheses, phone_mapper, phn_dict):
             if top_idx is not None:
                 consensus_slot_ids.append(slot_idx)
                 consensus_phone_ids.append(top_idx)
-        pairs = align_token_sequences(consensus_phone_ids, phone_ids)
+        consensus_times = [slot_time(slots[slot_idx]) for slot_idx in consensus_slot_ids]
+        pairs = align_token_sequences(
+            consensus_phone_ids,
+            phone_ids,
+            ref_times=consensus_times,
+            hyp_times=hyp.get('phone_times'),
+            hyp_confidences=hyp.get('phone_confidences'),
+            time_overlap_reward=0.3,
+        )
         cursor = 0
         matched_slots = set()
         for ref_pos, hyp_pos in pairs:
             if ref_pos is None:
                 insert_at = consensus_slot_ids[cursor] if cursor < len(consensus_slot_ids) else len(slots)
                 slot = insert_slot(slots, insert_at, eps_index, total_mass)
-                slot['counts'][phone_ids[hyp_pos]] += weight
+                quality = float(np.clip(
+                    0.5 * hyp['phone_confidences'][hyp_pos] + 0.5 * hyp['phone_acoustic_supports'][hyp_pos],
+                    0.0,
+                    1.0,
+                ))
+                add_slot_phone_mass(
+                    slot,
+                    phone_ids[hyp_pos],
+                    weight * quality,
+                    eps_index,
+                    eps_mass=weight * (1.0 - quality),
+                    phone_time=hyp['phone_times'][hyp_pos] if hyp_pos < len(hyp['phone_times']) else None,
+                    confidence=hyp['phone_confidences'][hyp_pos],
+                )
                 cursor += 1
             else:
                 slot_idx = consensus_slot_ids[ref_pos]
@@ -395,7 +685,20 @@ def build_pcn_from_hypotheses(hypotheses, phone_mapper, phn_dict):
                 if hyp_pos is None:
                     slots[slot_idx]['counts'][eps_index] += weight
                 else:
-                    slots[slot_idx]['counts'][phone_ids[hyp_pos]] += weight
+                    quality = float(np.clip(
+                        0.5 * hyp['phone_confidences'][hyp_pos] + 0.5 * hyp['phone_acoustic_supports'][hyp_pos],
+                        0.0,
+                        1.0,
+                    ))
+                    add_slot_phone_mass(
+                        slots[slot_idx],
+                        phone_ids[hyp_pos],
+                        weight * quality,
+                        eps_index,
+                        eps_mass=weight * (1.0 - quality),
+                        phone_time=hyp['phone_times'][hyp_pos] if hyp_pos < len(hyp['phone_times']) else None,
+                        confidence=hyp['phone_confidences'][hyp_pos],
+                    )
         for slot_idx, slot in enumerate(slots):
             if slot_idx not in matched_slots and sum(slot['counts'].values()) < total_mass + weight - EPS:
                 if slot_top_phone(slot['counts'], eps_index) is not None:
@@ -410,6 +713,8 @@ def build_pcn_from_hypotheses(hypotheses, phone_mapper, phn_dict):
 
     cn_post = np.zeros((len(slots), phone_dim), dtype=np.float32)
     top_phone_ids = []
+    slot_times = []
+    slot_confidences = []
     for slot_idx, slot in enumerate(slots):
         slot_mass = sum(slot['counts'].values())
         if slot_mass < total_mass:
@@ -418,10 +723,15 @@ def build_pcn_from_hypotheses(hypotheses, phone_mapper, phn_dict):
             cn_post[slot_idx, int(phone_idx)] = float(mass) / max(float(total_mass), EPS)
         cn_post[slot_idx] /= np.clip(cn_post[slot_idx].sum(), EPS, None)
         top_phone_ids.append(slot_top_phone(slot['counts'], eps_index))
+        slot_times.append(slot_time(slot))
+        conf_mass = max(float(slot.get('confidence_mass', 0.0)), EPS)
+        slot_confidences.append(float(np.clip(slot.get('confidence_sum', 0.0) / conf_mass, 0.0, 1.0)))
 
     return {
         'cn_post': cn_post,
         'top_phone_ids': top_phone_ids,
+        'slot_times': slot_times,
+        'slot_confidences': slot_confidences,
         'hyp_phone_rows': hyp_phone_rows,
         'hyp_weights': hyp_weights.tolist(),
         'id_to_phone': id_to_phone,
@@ -530,6 +840,98 @@ def pcn_stats(cn_post, top_phone_ids, prev_top_phone_ids, eps_index):
             dtype=np.float32,
         )
     return stats, prefix_stability
+
+
+def validate_pcn(pcn):
+    cn_post = np.asarray(pcn['cn_post'], dtype=np.float32)
+    if not np.isfinite(cn_post).all():
+        raise ValueError('pcn_contains_nan_or_inf')
+    sums = cn_post.sum(axis=-1)
+    if not np.allclose(sums, 1.0, atol=1e-3):
+        raise ValueError(f'pcn_posterior_not_normalized:max_abs_err={float(np.max(np.abs(sums - 1.0)))}')
+    eps_index = int(pcn['eps_index'])
+    if eps_index < 0 or eps_index >= cn_post.shape[-1]:
+        raise ValueError('invalid_epsilon_index')
+    eps_probs = cn_post[:, eps_index]
+    if np.any(eps_probs < -1e-6) or np.any(eps_probs > 1.0 + 1e-6):
+        raise ValueError('epsilon_probability_out_of_range')
+    for row in pcn.get('hyp_phone_rows', []):
+        for value in row.get('phone_confidences', []):
+            if not np.isfinite(value) or value < -1e-6 or value > 1.0 + 1e-6:
+                raise ValueError('phone_confidence_out_of_range')
+    for value in pcn.get('slot_confidences', []):
+        if not np.isfinite(value) or value < -1e-6 or value > 1.0 + 1e-6:
+            raise ValueError('slot_confidence_out_of_range')
+
+
+def cumulative_candidate_mask_from_asr(pcn_word_id, word_timestamps, commit_time, audio_end, is_final):
+    mask = np.zeros((pcn_word_id.shape[0],), dtype=np.float32)
+    committed_words = set()
+    for word_idx, word_time in enumerate(word_timestamps or []):
+        end_time = float(word_time.get('end', 0.0))
+        if end_time <= commit_time + 1e-6 or (is_final and end_time <= audio_end + 1e-6):
+            committed_words.add(int(word_idx))
+    for slot_idx, word_idx in enumerate(pcn_word_id.tolist()):
+        if int(word_idx) in committed_words:
+            mask[slot_idx] = 1.0
+    return mask
+
+
+def align_previous_commits(prev_state, current_top_phone_ids):
+    if prev_state is None:
+        return {}, [], []
+    prev_top_phone_ids = prev_state.get('top_phone_ids', [])
+    prev_committed = set(int(x) for x in prev_state.get('committed_slots', []))
+    pairs = align_token_sequences(prev_top_phone_ids, current_top_phone_ids, mismatch_cost=1.0)
+    prev_to_current = {}
+    for prev_idx, cur_idx in pairs:
+        if prev_idx is None or cur_idx is None:
+            continue
+        if prev_idx < len(prev_top_phone_ids) and cur_idx < len(current_top_phone_ids):
+            if prev_top_phone_ids[prev_idx] == current_top_phone_ids[cur_idx]:
+                prev_to_current[int(prev_idx)] = int(cur_idx)
+    mapped_old = sorted(prev_to_current[idx] for idx in prev_committed if idx in prev_to_current)
+    dropped = sorted(idx for idx in prev_committed if idx not in prev_to_current)
+    return prev_to_current, mapped_old, dropped
+
+
+def build_stateful_commit_masks(prev_state, pcn, pcn_word_id, word_timestamps, commit_time, audio_end, is_final):
+    candidate = cumulative_candidate_mask_from_asr(pcn_word_id, word_timestamps, commit_time, audio_end, is_final)
+    prev_to_current, mapped_old_slots, dropped_or_revised = align_previous_commits(prev_state, pcn['top_phone_ids'])
+    current_to_prev = np.zeros((len(pcn['top_phone_ids']),), dtype=np.int32) - 1
+    for prev_idx, cur_idx in prev_to_current.items():
+        if 0 <= cur_idx < current_to_prev.shape[0]:
+            current_to_prev[cur_idx] = int(prev_idx)
+    mapped_old_set = set(mapped_old_slots)
+    cumulative = candidate.copy()
+    for slot_idx in mapped_old_set:
+        if 0 <= slot_idx < cumulative.shape[0]:
+            cumulative[slot_idx] = 1.0
+
+    new_mask = np.zeros_like(cumulative)
+    for word_idx in sorted(set(int(x) for x in pcn_word_id.tolist() if int(x) >= 0)):
+        positions = np.flatnonzero(pcn_word_id == word_idx)
+        if positions.size == 0:
+            continue
+        word_committed = bool(np.all(candidate[positions] > 0))
+        if not word_committed:
+            continue
+        if any(int(pos) in mapped_old_set for pos in positions.tolist()):
+            continue
+        new_mask[positions] = 1.0
+
+    committed_slots = sorted(np.flatnonzero(cumulative > 0).astype(int).tolist())
+    new_slots = sorted(np.flatnonzero(new_mask > 0).astype(int).tolist())
+    diagnostics = {
+        'mapped_old_slots': mapped_old_slots,
+        'new_slots': new_slots,
+        'dropped_or_revised_slots': dropped_or_revised,
+    }
+    next_state = {
+        'top_phone_ids': list(pcn['top_phone_ids']),
+        'committed_slots': committed_slots,
+    }
+    return cumulative.astype(np.float32), new_mask.astype(np.float32), current_to_prev, diagnostics, next_state
 
 
 def acoustic_distribution_for_frames(frame_probs, phone_to_frame_id, phn_dict, phone_dim):
@@ -716,7 +1118,7 @@ def words_seen_in_nbest(hypotheses, gold_words):
     return seen
 
 
-def build_targets(item, cn_post, top_phone_ids, hypotheses, phn_dict, commit_time):
+def build_targets(item, cn_post, acoustic_post, acoustic_stats, top_phone_ids, hypotheses, phn_dict, cumulative_commit_mask):
     gt_rows = build_gt_phone_rows(item['gold_words'], item.get('gold_phone_segments', []))
     gt_tokens = [row['phone'] for row in gt_rows]
     id_to_phone = {idx: phone for phone, idx in phn_dict.items()}
@@ -736,21 +1138,25 @@ def build_targets(item, cn_post, top_phone_ids, hypotheses, phn_dict, commit_tim
     asr_correct_target = np.zeros((len(top_phone_ids),), dtype=np.float32)
     uncertainty_target = np.ones((len(top_phone_ids),), dtype=np.float32)
     soft_label_weight = np.zeros((len(top_phone_ids),), dtype=np.float32)
-    commit_mask = np.zeros((len(top_phone_ids),), dtype=np.float32)
+    confidence_target = np.zeros((len(top_phone_ids),), dtype=np.float32)
+    confidence_loss_mask = np.zeros((len(top_phone_ids),), dtype=np.float32)
+    abstention_target = np.zeros((len(top_phone_ids),), dtype=np.float32)
+    abstention_loss_mask = np.zeros((len(top_phone_ids),), dtype=np.float32)
 
     for slot_idx, gt_idx in slot_to_gt.items():
         gt = gt_rows[gt_idx]
         gt_phone_id = phn_dict.get(gt['phone'])
         if gt_phone_id is None:
             continue
-        committed = gt['end_time'] <= commit_time + 1e-6
+        committed = bool(slot_idx < len(cumulative_commit_mask) and cumulative_commit_mask[slot_idx] > 0)
         gt_word_seen = gt['word_id'] in seen_word_ids
         top_phone = slot_tokens[slot_idx]
         exact = top_phone == gt['phone']
         gt_posterior = float(cn_post[slot_idx, gt_phone_id])
         entropy = entropy_np(cn_post[slot_idx])
         entropy_norm = entropy / math.log(max(cn_post.shape[-1], 2))
-        commit_mask[slot_idx] = float(committed)
+        acoustic_support = float(acoustic_post[slot_idx, gt_phone_id]) if acoustic_post.shape[0] > slot_idx else 0.0
+        js_div = float(acoustic_stats[slot_idx, 3]) if acoustic_stats.shape[0] > slot_idx else 1.0
         phone_target[slot_idx] = np.array([float(gt_phone_id), float(gt['phone_score'])], dtype=np.float32)
         word_target[slot_idx] = np.array(
             [
@@ -769,6 +1175,18 @@ def build_targets(item, cn_post, top_phone_ids, hypotheses, phn_dict, commit_tim
             soft_label_weight[slot_idx] = gt_posterior
         else:
             soft_label_weight[slot_idx] = 0.0
+        if committed:
+            abstention_loss_mask[slot_idx] = 1.0
+            confidence_loss_mask[slot_idx] = float(gt_word_seen)
+            confidence_target[slot_idx] = float(
+                np.clip(soft_label_weight[slot_idx] * (1.0 - np.clip(entropy_norm, 0.0, 1.0)) * acoustic_support, 0.0, 1.0)
+            )
+            abstention_target[slot_idx] = float(
+                (not gt_word_seen)
+                or soft_label_weight[slot_idx] < 0.05
+                or (entropy_norm > 0.75 and js_div > 0.35)
+                or ((not exact) and acoustic_support < 0.2)
+            )
 
     return {
         'phone_target': phone_target,
@@ -776,18 +1194,23 @@ def build_targets(item, cn_post, top_phone_ids, hypotheses, phn_dict, commit_tim
         'asr_correct_target': asr_correct_target,
         'uncertainty_target': uncertainty_target,
         'soft_label_weight': soft_label_weight,
-        'commit_mask': commit_mask,
+        'confidence_target': confidence_target,
+        'confidence_loss_mask': confidence_loss_mask,
+        'abstention_target': abstention_target,
+        'abstention_loss_mask': abstention_loss_mask,
         'gt_word_seen_count': int(len(seen_word_ids)),
     }
 
 
-def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, phone_to_frame_id, args):
+def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, phone_to_frame_id, args, utterance_index=0):
     examples = []
     skipped_chunks = []
     utt_id = item['utt_id']
     audio, _ = librosa.load(item['audio_path'], sr=args.sample_rate, mono=True)
     final_time = max(item['word_end_times'].values()) if item['word_end_times'] else item['audio_duration']
     prev_top_phone_ids = []
+    prev_commit_state = None
+    previous_chunk_id = -1
 
     for chunk_id, commit_time in enumerate(commit_schedule(final_time, args.chunk_sec)):
         is_final = abs(commit_time - final_time) < 1e-5
@@ -808,7 +1231,19 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
                 'filtered_hypotheses': filtered_hypotheses,
             })
             continue
+        hypotheses = [
+            align_hypothesis_with_charsiu(
+                item=item,
+                row=dict(row),
+                phone_mapper=phone_mapper,
+                phn_dict=phn_dict,
+                phone_to_frame_id=phone_to_frame_id,
+                audio_end=audio_end,
+            )
+            for row in hypotheses
+        ]
         pcn = build_pcn_from_hypotheses(hypotheses, phone_mapper, phn_dict)
+        validate_pcn(pcn)
         pcn_word_id = top_hyp_word_ids_for_slots(pcn)
         cn_stats_arr, prefix_stability = pcn_stats(
             pcn['cn_post'],
@@ -828,18 +1263,34 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
         top_word_count = len(hypotheses[0]['words']) if hypotheses else 0
         top_phone_count = sum(1 for phone_idx in pcn['top_phone_ids'] if phone_idx is not None)
         prosody = compute_prosody(audio_prefix, args.sample_rate, audio_end, top_word_count, top_phone_count)
+        cumulative_commit_mask, new_commit_mask, mapped_old_slot, commit_diagnostics, prev_commit_state = build_stateful_commit_masks(
+            prev_commit_state,
+            pcn,
+            pcn_word_id,
+            hypotheses[0].get('word_timestamps', []) if hypotheses else [],
+            commit_time,
+            audio_end,
+            is_final,
+        )
         targets = build_targets(
             item=item,
             cn_post=pcn['cn_post'],
+            acoustic_post=acoustic_post,
+            acoustic_stats=acoustic_stats,
             top_phone_ids=pcn['top_phone_ids'],
             hypotheses=hypotheses,
             phn_dict=phn_dict,
-            commit_time=commit_time,
+            cumulative_commit_mask=cumulative_commit_mask,
         )
+        committed_word_ids = set(int(x) for x in pcn_word_id[cumulative_commit_mask > 0].tolist() if int(x) >= 0)
+        new_word_ids = set(int(x) for x in pcn_word_id[new_commit_mask > 0].tolist() if int(x) >= 0)
         examples.append({
             'utt_id': utt_id,
             'wav_path': item['audio_path'],
             'chunk_id': int(chunk_id),
+            'previous_chunk_id': int(previous_chunk_id),
+            'utterance_index': int(utterance_index),
+            'state_reset': int(previous_chunk_id < 0),
             'commit_time': float(commit_time),
             'audio_end': float(audio_end),
             'is_final': bool(is_final),
@@ -849,6 +1300,13 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
             'acoustic_stats': acoustic_stats.astype(np.float32),
             'prosody': prosody.astype(np.float32),
             'pcn_word_id': pcn_word_id.astype(np.int32),
+            'cumulative_commit_mask': cumulative_commit_mask.astype(np.float32),
+            'new_commit_mask': new_commit_mask.astype(np.float32),
+            'commit_mask': cumulative_commit_mask.astype(np.float32),
+            'mapped_old_slot': mapped_old_slot.astype(np.int32),
+            'new_committed_word_count': int(len(new_word_ids)),
+            'cumulative_committed_word_count': int(len(committed_word_ids)),
+            'commit_alignment_diagnostics': commit_diagnostics,
             **targets,
             'utt_target': np.array(
                 [
@@ -864,11 +1322,14 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
             'raw_hypothesis_count': int(len(raw_hypotheses)),
             'filtered_hypotheses': filtered_hypotheses,
             'hyp_weights': pcn['hyp_weights'],
+            'slot_confidences': pcn.get('slot_confidences', []),
+            'slot_times': pcn.get('slot_times', []),
             'prefix_stability': float(prefix_stability),
             'visible_frame_count': int(visible_frame_count),
             'top_phone_count': int(top_phone_count),
             'coverage_ratio': float(audio_end / max(final_time, EPS)),
         })
+        previous_chunk_id = int(chunk_id)
     return examples, skipped_chunks
 
 
@@ -876,7 +1337,7 @@ def build_split(split_name, split_items, scores, charsiu, asr_generator, phone_m
     examples = []
     skipped = []
     skipped_chunks = []
-    for utt_id, audio_path in tqdm(split_items, desc=f'{split_name}-pcn'):
+    for utterance_index, (utt_id, audio_path) in enumerate(tqdm(split_items, desc=f'{split_name}-pcn')):
         aligned = align_gold_utterance(
             utt_id=utt_id,
             audio_path=audio_path,
@@ -898,6 +1359,7 @@ def build_split(split_name, split_items, scores, charsiu, asr_generator, phone_m
                 phn_dict=phn_dict,
                 phone_to_frame_id=phone_to_frame_id,
                 args=args,
+                utterance_index=utterance_index,
             )
             examples.extend(cur_examples)
             skipped_chunks.extend(cur_skipped_chunks)
@@ -940,6 +1402,13 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         'uncertainty_target': [],
         'soft_label_weight': [],
         'commit_mask': [],
+        'cumulative_commit_mask': [],
+        'new_commit_mask': [],
+        'mapped_old_slot': [],
+        'confidence_target': [],
+        'confidence_loss_mask': [],
+        'abstention_target': [],
+        'abstention_loss_mask': [],
         'teacher_prefix_utt_score': [],
         'teacher_final_utt_score': [],
         'teacher_utt_mask': [],
@@ -948,6 +1417,13 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         'coverage_ratio': [],
         'visible_len': [],
         'is_final': [],
+        'chunk_id': [],
+        'previous_chunk_id': [],
+        'utterance_index': [],
+        'state_reset': [],
+        'new_committed_word_count': [],
+        'cumulative_committed_word_count': [],
+        'prefix_stability': [],
     }
     manifest = []
     for example in examples:
@@ -965,6 +1441,13 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         arrays['uncertainty_target'].append(pad_2d(example['uncertainty_target'].reshape(-1, 1), seq_len, fill_value=1.0).reshape(seq_len))
         arrays['soft_label_weight'].append(pad_2d(example['soft_label_weight'].reshape(-1, 1), seq_len).reshape(seq_len))
         arrays['commit_mask'].append(pad_2d(example['commit_mask'].reshape(-1, 1), seq_len).reshape(seq_len))
+        arrays['cumulative_commit_mask'].append(pad_2d(example['cumulative_commit_mask'].reshape(-1, 1), seq_len).reshape(seq_len))
+        arrays['new_commit_mask'].append(pad_2d(example['new_commit_mask'].reshape(-1, 1), seq_len).reshape(seq_len))
+        arrays['mapped_old_slot'].append(pad_2d(example['mapped_old_slot'].reshape(-1, 1), seq_len, fill_value=-1).reshape(seq_len))
+        arrays['confidence_target'].append(pad_2d(example['confidence_target'].reshape(-1, 1), seq_len).reshape(seq_len))
+        arrays['confidence_loss_mask'].append(pad_2d(example['confidence_loss_mask'].reshape(-1, 1), seq_len).reshape(seq_len))
+        arrays['abstention_target'].append(pad_2d(example['abstention_target'].reshape(-1, 1), seq_len).reshape(seq_len))
+        arrays['abstention_loss_mask'].append(pad_2d(example['abstention_loss_mask'].reshape(-1, 1), seq_len).reshape(seq_len))
         arrays['teacher_prefix_utt_score'].append(np.asarray(example.get('teacher_prefix_utt_score', np.zeros((5,), dtype=np.float32)), dtype=np.float32))
         arrays['teacher_final_utt_score'].append(np.asarray(example.get('teacher_final_utt_score', np.zeros((5,), dtype=np.float32)), dtype=np.float32))
         arrays['teacher_utt_mask'].append(float(example.get('teacher_utt_mask', 0.0)))
@@ -983,10 +1466,20 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         arrays['coverage_ratio'].append(float(example.get('coverage_ratio', 0.0)))
         arrays['visible_len'].append(visible_len)
         arrays['is_final'].append(int(example['is_final']))
+        arrays['chunk_id'].append(int(example['chunk_id']))
+        arrays['previous_chunk_id'].append(int(example['previous_chunk_id']))
+        arrays['utterance_index'].append(int(example['utterance_index']))
+        arrays['state_reset'].append(int(example['state_reset']))
+        arrays['new_committed_word_count'].append(int(example['new_committed_word_count']))
+        arrays['cumulative_committed_word_count'].append(int(example['cumulative_committed_word_count']))
+        arrays['prefix_stability'].append(float(example['prefix_stability']))
         manifest.append({
             'utt_id': example['utt_id'],
             'wav_path': example.get('wav_path', ''),
             'chunk_id': int(example['chunk_id']),
+            'previous_chunk_id': int(example['previous_chunk_id']),
+            'utterance_index': int(example['utterance_index']),
+            'state_reset': int(example['state_reset']),
             'commit_time': float(example['commit_time']),
             'audio_end': float(example['audio_end']),
             'is_final': bool(example['is_final']),
@@ -997,13 +1490,28 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
             'coverage_ratio': float(example.get('coverage_ratio', 0.0)),
             'gt_word_seen_count': int(example['gt_word_seen_count']),
             'supervised_slot_count': int(np.sum(example['soft_label_weight'] > 0)),
+            'new_committed_word_count': int(example['new_committed_word_count']),
+            'cumulative_committed_word_count': int(example['cumulative_committed_word_count']),
+            'commit_alignment_diagnostics': example.get('commit_alignment_diagnostics', {}),
             'raw_hypothesis_count': int(example.get('raw_hypothesis_count', len(example['hypotheses']))),
             'kept_hypothesis_count': int(len(example['hypotheses'])),
             'filtered_hypotheses': example.get('filtered_hypotheses', []),
             'hyp_text': [row['text'] for row in example['hypotheses']],
             'hyp_logprob': [float(row['logprob']) for row in example['hypotheses']],
+            'hyp_sequence_score': [float(row.get('sequence_score', row.get('logprob', 0.0))) for row in example['hypotheses']],
+            'hyp_length_normalized_sequence_score': [
+                float(row.get('length_normalized_sequence_score', row.get('logprob', 0.0)))
+                for row in example['hypotheses']
+            ],
             'hyp_weight': [float(weight) for weight in example['hyp_weights']],
             'word_timestamps': [row['word_timestamps'] for row in example['hypotheses']],
+            'timestamp_source': [row.get('timestamp_source', '') for row in example['hypotheses']],
+            'token_ids': [row.get('token_ids', []) for row in example['hypotheses']],
+            'token_logprobs': [row.get('token_logprobs', []) for row in example['hypotheses']],
+            'token_confidences': [row.get('token_confidences', []) for row in example['hypotheses']],
+            'word_token_ranges': [row.get('word_token_ranges', []) for row in example['hypotheses']],
+            'word_logprobs': [row.get('word_logprobs', []) for row in example['hypotheses']],
+            'word_confidences': [row.get('word_confidences', []) for row in example['hypotheses']],
         })
 
     return {
@@ -1020,6 +1528,13 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         'uncertainty_target': np.stack(arrays['uncertainty_target']).astype(np.float32),
         'soft_label_weight': np.stack(arrays['soft_label_weight']).astype(np.float32),
         'commit_mask': np.stack(arrays['commit_mask']).astype(np.float32),
+        'cumulative_commit_mask': np.stack(arrays['cumulative_commit_mask']).astype(np.float32),
+        'new_commit_mask': np.stack(arrays['new_commit_mask']).astype(np.float32),
+        'mapped_old_slot': np.stack(arrays['mapped_old_slot']).astype(np.int32),
+        'confidence_target': np.stack(arrays['confidence_target']).astype(np.float32),
+        'confidence_loss_mask': np.stack(arrays['confidence_loss_mask']).astype(np.float32),
+        'abstention_target': np.stack(arrays['abstention_target']).astype(np.float32),
+        'abstention_loss_mask': np.stack(arrays['abstention_loss_mask']).astype(np.float32),
         'teacher_prefix_utt_score': np.stack(arrays['teacher_prefix_utt_score']).astype(np.float32),
         'teacher_final_utt_score': np.stack(arrays['teacher_final_utt_score']).astype(np.float32),
         'teacher_utt_mask': np.asarray(arrays['teacher_utt_mask'], dtype=np.float32),
@@ -1028,6 +1543,13 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         'coverage_ratio': np.asarray(arrays['coverage_ratio'], dtype=np.float32),
         'visible_len': np.asarray(arrays['visible_len'], dtype=np.int32),
         'is_final': np.asarray(arrays['is_final'], dtype=np.int8),
+        'chunk_id': np.asarray(arrays['chunk_id'], dtype=np.int32),
+        'previous_chunk_id': np.asarray(arrays['previous_chunk_id'], dtype=np.int32),
+        'utterance_index': np.asarray(arrays['utterance_index'], dtype=np.int32),
+        'state_reset': np.asarray(arrays['state_reset'], dtype=np.int8),
+        'new_committed_word_count': np.asarray(arrays['new_committed_word_count'], dtype=np.int32),
+        'cumulative_committed_word_count': np.asarray(arrays['cumulative_committed_word_count'], dtype=np.int32),
+        'prefix_stability': np.asarray(arrays['prefix_stability'], dtype=np.float32),
         'manifest': manifest,
     }
 
@@ -1048,6 +1570,13 @@ def save_split(split_name, arrays, output_dir):
         uncertainty_target=arrays['uncertainty_target'],
         soft_label_weight=arrays['soft_label_weight'],
         commit_mask=arrays['commit_mask'],
+        cumulative_commit_mask=arrays['cumulative_commit_mask'],
+        new_commit_mask=arrays['new_commit_mask'],
+        mapped_old_slot=arrays['mapped_old_slot'],
+        confidence_target=arrays['confidence_target'],
+        confidence_loss_mask=arrays['confidence_loss_mask'],
+        abstention_target=arrays['abstention_target'],
+        abstention_loss_mask=arrays['abstention_loss_mask'],
         teacher_prefix_utt_score=arrays['teacher_prefix_utt_score'],
         teacher_final_utt_score=arrays['teacher_final_utt_score'],
         teacher_utt_mask=arrays['teacher_utt_mask'],
@@ -1056,6 +1585,13 @@ def save_split(split_name, arrays, output_dir):
         coverage_ratio=arrays['coverage_ratio'],
         visible_len=arrays['visible_len'],
         is_final=arrays['is_final'],
+        chunk_id=arrays['chunk_id'],
+        previous_chunk_id=arrays['previous_chunk_id'],
+        utterance_index=arrays['utterance_index'],
+        state_reset=arrays['state_reset'],
+        new_committed_word_count=arrays['new_committed_word_count'],
+        cumulative_committed_word_count=arrays['cumulative_committed_word_count'],
+        prefix_stability=arrays['prefix_stability'],
     )
     with open(output_dir / f'{split_name}_manifest.jsonl', 'w', encoding='utf-8') as handle:
         for row in arrays['manifest']:
@@ -1155,8 +1691,14 @@ def main():
         arrays = build_arrays(split_examples[split_name], seq_len, phone_dim, len(prosody_names))
         save_split(split_name, arrays, output_dir)
 
+    timestamp_counter = Counter()
+    for example in all_examples:
+        for row in example.get('hypotheses', []):
+            timestamp_counter[row.get('timestamp_source', 'unknown')] += 1
+
     metadata = {
-        'schema': 'streaming_pcn_gopt_v1',
+        'schema': PCN_SCHEMA,
+        'pcn_type': PCN_TYPE,
         'dataset_root': str(dataset_root),
         'scores_json': str(scores_path),
         'split_meta': split_meta,
@@ -1195,9 +1737,23 @@ def main():
             'uncertainty_target',
             'soft_label_weight',
             'commit_mask',
+            'cumulative_commit_mask',
+            'new_commit_mask',
+            'mapped_old_slot',
+            'confidence_target',
+            'confidence_loss_mask',
+            'abstention_target',
+            'abstention_loss_mask',
             'pcn_word_id',
             'visible_len',
             'is_final',
+            'chunk_id',
+            'previous_chunk_id',
+            'utterance_index',
+            'state_reset',
+            'new_committed_word_count',
+            'cumulative_committed_word_count',
+            'prefix_stability',
             'teacher_prefix_utt_score',
             'teacher_final_utt_score',
             'teacher_word_score',
@@ -1218,7 +1774,14 @@ def main():
             'teacher_word_mask': '1 where teacher_word_score is valid.',
             'coverage_ratio': 'audio_end/full_duration, used by prefix-to-final distillation.',
         },
-        'word_timestamp_policy': 'N-best generation returns sequence scores. Word timestamps are stored as duration-proportional estimates; PCN/acoustic alignment uses Charsiu frames.',
+        'word_timestamp_policy': 'Primary path aligns each N-best G2P phone sequence to Charsiu frame posteriors and aggregates phone spans to words. duration_proportional_fallback is used only when hypothesis alignment fails.',
+        'timestamp_source_counts': dict(timestamp_counter),
+        'streaming_state_policy': {
+            'cumulative_commit_mask': 'All ASR/PCN slots committed by the current chunk, including old slots mapped from previous chunks.',
+            'new_commit_mask': 'Only newly committed complete top-hypothesis words after monotonic top-phone mapping from the previous chunk.',
+            'gru_update': 'The sentence GRU must update only from new_commit_mask; commit_mask is a cumulative compatibility alias.',
+            'commit_inputs': 'Commit logic uses ASR/PCN hypothesis timestamps, prefix stability, audio time, and Charsiu acoustic evidence; GT is only used for training labels and loss masks.',
+        },
         'skipped': skipped,
     }
     with open(output_dir / 'metadata.json', 'w', encoding='utf-8') as handle:

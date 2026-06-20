@@ -1,0 +1,42 @@
+{
+  "data_dir": "/DATA_2/guest/custom-gopt/data/streaming_asr_gopt_v6_asrconf",
+  "input_dim": 47,
+  "phn_num": 40,
+  "seq_len": 692,
+  "args": {
+    "data_dir": "/DATA_2/guest/custom-gopt/data/streaming_asr_gopt_v6_asrconf",
+    "exp_dir": "/DATA_2/guest/custom-gopt/exp/streaming-asr-gopt-v6-asrconf",
+    "lr": 0.001,
+    "n_epochs": 100,
+    "depth": 3,
+    "heads": 1,
+    "batch_size": 64,
+    "embed_dim": 24,
+    "loss_w_phn": 1.0,
+    "loss_w_word": 1.0,
+    "loss_w_word_asr": 1.0,
+    "loss_w_utt": 1.0,
+    "model": "streaming_gopt",
+    "noise": 0.0,
+    "num_workers": 4,
+    "device": "cuda",
+    "main_context_tokens": "4,8,12,16",
+    "right_context_tokens": "0,1,2,4",
+    "compile": false,
+    "tf32": false,
+    "seed": 1337,
+    "resume": false,
+    "main_context_token_choices": [
+      4,
+      8,
+      12,
+      16
+    ],
+    "right_context_token_choices": [
+      0,
+      1,
+      2,
+      4
+    ]
+  }
+}

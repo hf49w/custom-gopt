@@ -182,7 +182,9 @@ Bash commands are the same in WSL, except use `/` path separators and add `--res
 
 ## PCN/N-best Streaming Data
 
-`src/prep_data/build_streaming_pcn_gopt_data.py` builds the next-generation streaming dataset without changing the existing v6 ASR-driven pipeline. It uses SpeechOcean762 GT text/phones/scores only for offline training supervision; GT is not an inference input.
+`src/prep_data/build_streaming_pcn_gopt_data.py` builds the stateful PCN dataset without changing the existing v6 ASR-driven pipeline. The schema is `streaming_pcn_gopt_v2_stateful`.
+
+This is an N-best-derived phoneme confusion network, not a strict ASR lattice. It is built from Whisper N-best text hypotheses, local token/word transition scores, G2P phones, and Charsiu acoustic evidence. SpeechOcean762 GT text/phones/scores are used only to create training labels and loss masks; inference does not read GT text, phones, `scores.json`, or SpeechOcean labels.
 
 Example:
 
@@ -190,7 +192,7 @@ Example:
 python src\prep_data\build_streaming_pcn_gopt_data.py `
   --dataset-root ..\speechocean762\speechocean762 `
   --scores-json src\prep_data\scores.json `
-  --output-dir data\streaming_pcn_gopt `
+  --output-dir data\streaming_pcn_gopt_v2_stateful `
   --aligner-model charsiu/en_w2v2_tiny_fc_10ms `
   --asr-model exp\streaming-whisper-base\best_model `
   --language english `
@@ -212,9 +214,16 @@ Main arrays in each `<split>_chunks.npz`:
 - `asr_correct_target`: whether the slot/word is supported as ASR-correct.
 - `uncertainty_target`: high when GT is absent from N-best or the CN posterior is uncertain.
 - `soft_label_weight`: 1 for exact matches, PCN posterior for approximate phone matches, 0 for mismatches or GT absent from N-best.
-- `commit_mask`, `visible_len`, `is_final`: streaming masks and chunk state.
+- `commit_mask`: compatibility alias for `cumulative_commit_mask`.
+- `cumulative_commit_mask`: all PCN slots committed by this chunk.
+- `new_commit_mask`: only newly committed complete words after monotonic top-phone mapping from the previous chunk.
+- `mapped_old_slot`: current-slot to previous-slot mapping for stability training.
+- `previous_chunk_id`, `utterance_index`, `state_reset`, `new_committed_word_count`, `cumulative_committed_word_count`: stateful streaming metadata.
+- `confidence_target`, `confidence_loss_mask`: soft reliability targets from soft label weight, PCN entropy, and Charsiu acoustic support.
+- `abstention_target`, `abstention_loss_mask`: whether a slot should abstain from reliable diagnosis.
+- `visible_len`, `is_final`: chunk visibility and final-chunk marker.
 
-This builder calls the real Transformers `generate(..., num_return_sequences=K, output_scores=True, return_dict_in_generate=True)` path for N-best hypotheses and sequence scores. Per-hypothesis word timestamps are currently stored as duration-proportional estimates; acoustic alignment and training features rely on Charsiu frame evidence rather than those estimated timestamps.
+This builder calls the real Transformers `generate(..., num_return_sequences=K, output_scores=True, return_dict_in_generate=True)` path and stores `token_ids`, `token_logprobs`, `token_confidences`, `word_token_ranges`, `word_logprobs`, `word_confidences`, `sequence_score`, and `length_normalized_sequence_score`. Word timestamps are primarily obtained by aligning each N-best G2P phone sequence to Charsiu frame posteriors and aggregating phone spans to words (`timestamp_source="charsiu_hypothesis_alignment"`). If that fails, the script falls back to duration-proportional estimates and records `timestamp_source="duration_proportional_fallback"` plus metadata counts.
 
 ### PCN Student Training
 
@@ -225,23 +234,48 @@ The PCN student model is `PCNStreamingScorer` in `src/models/streaming_pcn_gopt.
 - DSP prosody statistics -> 8D projection.
 - Reliability gate from CN entropy, acoustic entropy, PCN-Charsiu JS divergence, and prefix stability.
 - Local causal Transformer over PCN slots.
-- Online word pooling over newly committed slots.
+- Online word pooling over `new_commit_mask` only.
 - Causal GRU sentence state without tail CLS tokens.
 - Heads for phone score, word scores, utterance scores, ASR correctness, uncertainty, confidence, and abstention.
+
+The GRU is trained in true streaming order. `PCNUtteranceDataset` groups all chunks for one utterance, `DataLoader` may shuffle utterances but never shuffles chunks inside an utterance, and training unrolls:
+
+```python
+state = None
+for chunk in utterance_chunks:
+    if state_reset:
+        state = None
+    output = model(..., new_commit_mask=chunk["new_commit_mask"], prev_state=state)
+    state = output["next_state"]
+```
+
+`forward(..., detach_next_state=False)` keeps gradients across chunks by default. Use `--tbptt-steps N` to detach every N chunks. `stream_step(...)` detaches state for inference.
 
 Train without teacher distillation:
 
 ```powershell
 python src\train_streaming_pcn.py `
-  --data-dir data\streaming_pcn_gopt `
+  --data-dir data\streaming_pcn_gopt_v2_stateful `
   --exp-dir exp\streaming-pcn-gopt `
   --embed-dim 40 `
   --depth 2 `
   --heads 2 `
   --gru-dim 32 `
   --batch-size 32 `
+  --tbptt-steps 0 `
   --n-epochs 80
 ```
+
+The trainer adds confidence, abstention, calibration, and adjacent-chunk stability losses:
+
+- `--loss-w-confidence` default `0.2`
+- `--loss-w-abstention` default `0.2`
+- `--loss-w-calibration` default `0.1`
+- `--loss-w-phone-stability` default `0.02`
+- `--loss-w-word-stability` default `0.02`
+- `--loss-w-utt-stability` default `0.02`
+
+`state_projection` is disabled by default. It is created only when `teacher_state_embedding` exists in the data and `--loss-w-state-projection > 0`; otherwise no hidden-state distillation is claimed or trained.
 
 ### Optional MultiPA Prefix Distillation
 
@@ -259,8 +293,8 @@ Then inject the teacher scores into the PCN NPZ files:
 
 ```powershell
 python scripts\local\inject_multipa_teacher_pcn.py `
-  --data-dir data\streaming_pcn_gopt `
-  --teacher-jsonl data\streaming_pcn_gopt\multipa_train_prefix.jsonl `
+  --data-dir data\streaming_pcn_gopt_v2_stateful `
+  --teacher-jsonl data\streaming_pcn_gopt_v2_stateful\multipa_train_prefix.jsonl `
   --splits train
 ```
 
@@ -274,6 +308,23 @@ Run the same command for `val` and `test` JSONL files when available. `inject_mu
 - `teacher_word_mask`
 
 MultiPA does not output completeness, so `teacher_utt_dim_mask[:, 1] = 0`; human labels still supervise completeness.
+
+### No-GT Streaming Inference
+
+`scripts/local/infer_streaming_pcn.py` runs the deployed path. Inputs are only WAV, Whisper, Charsiu, and the PCN checkpoint/config:
+
+```powershell
+python scripts\local\infer_streaming_pcn.py `
+  --wav sample.wav `
+  --whisper-model openai/whisper-base `
+  --aligner-model charsiu/en_w2v2_tiny_fc_10ms `
+  --checkpoint exp\streaming-pcn-gopt\models\best_audio_model.pth `
+  --config exp\streaming-pcn-gopt\config.json `
+  --output-jsonl exp\streaming-pcn-gopt\sample_stream.jsonl `
+  --device cuda
+```
+
+For each chunk it writes `chunk_id`, `audio_end`, committed hypotheses, newly committed words, PCN summary, phone/word/utterance scores, confidence, abstention probability, whether the sentence state updated, commit diagnostics, and `process_time_sec`.
 
 ## Notes
 

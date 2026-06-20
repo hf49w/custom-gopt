@@ -8,7 +8,7 @@ import numpy as np
 
 def get_args():
     parser = argparse.ArgumentParser(
-        description='Inject MultiPA prefix/full-audio teacher scores into streaming_pcn_gopt_v1 NPZ files.'
+        description='Inject MultiPA prefix/full-audio teacher scores into streaming_pcn_gopt_v2_stateful NPZ files.'
     )
     parser.add_argument('--data-dir', type=Path, required=True)
     parser.add_argument('--teacher-jsonl', type=Path, required=True, help='Output from MultiPA/eval_multipa_prefix.py.')
@@ -46,9 +46,10 @@ def utt_score(row):
 
 def teacher_word_table(row):
     rows = row.get('word_scores') or []
+    top_level_times = row.get('teacher_word_time') or []
     scores = []
     times = []
-    for item in rows:
+    for idx, item in enumerate(rows):
         scores.append(
             [
                 float(item.get('pred_accuracy', 0.0) or 0.0),
@@ -58,6 +59,8 @@ def teacher_word_table(row):
         )
         if 'start' in item and 'end' in item:
             times.append((float(item['start']), float(item['end'])))
+        elif idx < len(top_level_times) and top_level_times[idx] is not None:
+            times.append((float(top_level_times[idx][0]), float(top_level_times[idx][1])))
         else:
             times.append(None)
     return np.asarray(scores, dtype=np.float32), times

@@ -1,0 +1,30 @@
+{
+  "status": "ok",
+  "audio_path": "D:/研究生/模型/charsiu/charsiu_repo/local/SA1.WAV",
+  "bundle_dir": "D:/研究生/智能体/gopt_charsiu/hf_bundle/custom-gopt-252-eval",
+  "device": "cpu",
+  "transcript": "She had your dark suit in greasy wash water all year.",
+  "utterance_scores": {
+    "accuracy": 5.0,
+    "completeness": 5.0,
+    "fluency": 5.0,
+    "prosodic": 5.0,
+    "total": 5.0
+  },
+  "overall_score": 5.0,
+  "num_phone_segments": 34,
+  "num_asr_words": 11,
+  "recognized_words": [
+    "she",
+    "had",
+    "your",
+    "dark",
+    "suit",
+    "in",
+    "greasy",
+    "wash",
+    "water",
+    "all",
+    "year"
+  ]
+}

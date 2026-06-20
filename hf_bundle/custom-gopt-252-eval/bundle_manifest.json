@@ -1,0 +1,107 @@
+{
+  "repo_id": "faeea/custom-gopt-252-eval",
+  "description": "Bundle of the v6 ASR-confidence Streaming GOPT checkpoint plus the Whisper and Charsiu models required by the local evaluation pipeline.",
+  "artifacts": [
+    {
+      "path": "streaming_gopt_best/best_audio_model.pth",
+      "type": "streaming_gopt_weights",
+      "purpose": "Pronunciation scoring model selected by validation phone MSE."
+    },
+    {
+      "path": "streaming_gopt_best/config.json",
+      "type": "streaming_gopt_config",
+      "purpose": "Network shape and training arguments used to restore the v6 ASR-confidence model."
+    },
+    {
+      "path": "streaming_gopt_best/result.csv",
+      "type": "training_metrics",
+      "purpose": "Per-epoch train/validation metrics."
+    },
+    {
+      "path": "streaming_gopt_best/test_metrics.json",
+      "type": "test_metrics",
+      "purpose": "Held-out test metrics for the best validation checkpoint."
+    },
+    {
+      "path": "streaming_gopt_best/inference_assets.json",
+      "type": "inference_metadata",
+      "purpose": "Normalization stats, feature dimension, and phone-id mapping required for one-audio local inference."
+    },
+    {
+      "path": "whisper_best_model",
+      "type": "transformers_whisper_model",
+      "purpose": "ASR model used to build ASR-driven GOPT chunks."
+    },
+    {
+      "path": "charsiu_en_w2v2_tiny_fc_10ms",
+      "type": "charsiu_aligner_model",
+      "purpose": "Frame-level phone alignment model used by preprocessing and inference."
+    },
+    {
+      "path": "examples/infer_one_audio.py",
+      "type": "example_script",
+      "purpose": "Minimal one-audio local inference script that prints utterance-level scores."
+    },
+    {
+      "path": "examples/eval_streaming_gopt_test.py",
+      "type": "example_script",
+      "purpose": "Minimal evaluation script for val/test split using the bundled best GOPT checkpoint."
+    }
+  ],
+  "model_outputs": {
+    "utterance": [
+      "accuracy",
+      "completeness",
+      "fluency",
+      "prosodic",
+      "total"
+    ],
+    "phone": [
+      "phone pronunciation score"
+    ],
+    "word": [
+      "accuracy",
+      "stress",
+      "total",
+      "asr_accuracy"
+    ],
+    "word_asr_accuracy_note": "The word-level ASR accuracy score can be used as an auxiliary indicator of whether the word was read correctly."
+  },
+  "best_validation_summary": {
+    "selection_metric": "phone_val_mse",
+    "best_epoch": 11,
+    "phone_val_mse": 0.04760764539241791,
+    "phone_val_pcc": 0.34831968338670993,
+    "utt_val_pcc_total": 0.661865583803676,
+    "word_val_pcc_total": 0.3418123225833971,
+    "word_val_pcc_asr_accuracy": 0.3633849619530143
+  },
+  "test_summary": {
+    "phone_test_mse": 0.04919730871915817,
+    "phone_test_pcc": 0.3975705055993251,
+    "utt_test_pcc": [
+      0.651909193610124,
+      0.012690043750859805,
+      0.7249977587357453,
+      0.7332794084754206,
+      0.681940037784353
+    ],
+    "word_test_pcc": [
+      0.4047142491023989,
+      -0.0039119825110344765,
+      0.4122583381095728,
+      0.41746734262039764
+    ],
+    "word_score_names": [
+      "accuracy",
+      "stress",
+      "total",
+      "asr_accuracy"
+    ]
+  },
+  "code_dependencies": {
+    "custom_gopt_repo": "https://github.com/hf49w/custom-gopt.git",
+    "charsiu_repo": "https://github.com/lingjzhu/charsiu",
+    "charsiu_repo_commit": "13a69f2a22ca0c0962b75cc693399b0ae23a12c9"
+  }
+}
