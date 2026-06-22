@@ -48,22 +48,30 @@ def teacher_word_table(row):
     rows = row.get('word_scores') or []
     top_level_times = row.get('teacher_word_time') or []
     scores = []
+    dim_masks = []
     times = []
     for idx, item in enumerate(rows):
-        scores.append(
-            [
-                float(item.get('pred_accuracy', 0.0) or 0.0),
-                float(item.get('pred_stress', 0.0) or 0.0),
-                float(item.get('pred_total', 0.0) or 0.0),
-            ]
-        )
+        cur_scores = []
+        cur_mask = []
+        for key in ['pred_accuracy', 'pred_stress', 'pred_total']:
+            value = item.get(key)
+            try:
+                value = float(value)
+                valid = bool(np.isfinite(value))
+            except (TypeError, ValueError):
+                value = 0.0
+                valid = False
+            cur_scores.append(value if valid else 0.0)
+            cur_mask.append(1.0 if valid else 0.0)
+        scores.append(cur_scores)
+        dim_masks.append(cur_mask)
         if 'start' in item and 'end' in item:
             times.append((float(item['start']), float(item['end'])))
         elif idx < len(top_level_times) and top_level_times[idx] is not None:
             times.append((float(top_level_times[idx][0]), float(top_level_times[idx][1])))
         else:
             times.append(None)
-    return np.asarray(scores, dtype=np.float32), times
+    return np.asarray(scores, dtype=np.float32), times, np.asarray(dim_masks, dtype=np.float32)
 
 
 def overlap_ratio(a_start, a_end, b_start, b_end):
@@ -77,9 +85,10 @@ def overlap_ratio(a_start, a_end, b_start, b_end):
 def align_word_scores(manifest_row, pcn_word_ids, teacher_row, seq_len):
     out = np.zeros((seq_len, 3), dtype=np.float32)
     mask = np.zeros((seq_len,), dtype=np.float32)
-    teacher_scores, teacher_times = teacher_word_table(teacher_row)
+    dim_mask = np.zeros((seq_len, 3), dtype=np.float32)
+    teacher_scores, teacher_times, teacher_dim_masks = teacher_word_table(teacher_row)
     if teacher_scores.size == 0:
-        return out, mask
+        return out, mask, dim_mask
 
     top_word_times = []
     word_timestamp_groups = manifest_row.get('word_timestamps') or []
@@ -112,8 +121,9 @@ def align_word_scores(manifest_row, pcn_word_ids, teacher_row, seq_len):
         if chosen is None:
             continue
         out[slot_idx] = teacher_scores[chosen]
-        mask[slot_idx] = 1.0
-    return out, mask
+        dim_mask[slot_idx] = teacher_dim_masks[chosen]
+        mask[slot_idx] = float(np.any(teacher_dim_masks[chosen] > 0))
+    return out, mask, dim_mask
 
 
 def load_manifest(data_dir, split):
@@ -157,6 +167,7 @@ def main():
         teacher_mask = np.zeros((count,), dtype=np.float32)
         teacher_word_score = np.zeros((count, seq_len, 3), dtype=np.float32)
         teacher_word_mask = np.zeros((count, seq_len), dtype=np.float32)
+        teacher_word_dim_mask = np.zeros((count, seq_len, 3), dtype=np.float32)
 
         final_by_utt = {}
         for row in manifest:
@@ -180,9 +191,15 @@ def main():
             teacher_final[idx] = final_score
             teacher_dim_mask[idx] = dim_mask
             teacher_mask[idx] = 1.0
-            word_score, word_mask = align_word_scores(row, arrays['pcn_word_id'][idx], teacher_row, seq_len)
+            word_score, word_mask, word_dim_mask = align_word_scores(
+                row,
+                arrays['pcn_word_id'][idx],
+                teacher_row,
+                seq_len,
+            )
             teacher_word_score[idx] = word_score
             teacher_word_mask[idx] = word_mask
+            teacher_word_dim_mask[idx] = word_dim_mask
 
         arrays['teacher_prefix_utt_score'] = teacher_prefix
         arrays['teacher_final_utt_score'] = teacher_final
@@ -190,6 +207,7 @@ def main():
         arrays['teacher_utt_dim_mask'] = teacher_dim_mask
         arrays['teacher_word_score'] = teacher_word_score
         arrays['teacher_word_mask'] = teacher_word_mask
+        arrays['teacher_word_dim_mask'] = teacher_word_dim_mask
         dst_path = output_dir / f'{split}_chunks.npz'
         if dst_path.exists() and output_dir == args.data_dir:
             shutil.copy2(dst_path, dst_path.with_suffix('.npz.bak'))
@@ -201,6 +219,7 @@ def main():
                     'rows': int(count),
                     'teacher_rows_used': int(teacher_mask.sum()),
                     'teacher_word_slots': int(teacher_word_mask.sum()),
+                    'teacher_word_dimensions': int(teacher_word_dim_mask.sum()),
                     'output': str(dst_path),
                 },
                 ensure_ascii=False,

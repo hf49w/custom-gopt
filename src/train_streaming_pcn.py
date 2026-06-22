@@ -315,6 +315,13 @@ def compute_sequential_losses(model, batch, args):
         supervise_weight = chunk['soft_label_weight'] * chunk['cumulative_commit_mask'] * valid_mask
         teacher_mask = chunk.get('teacher_utt_mask', torch.zeros_like(cur_valid)) * cur_valid
         teacher_dim_mask = chunk.get('teacher_utt_dim_mask', torch.zeros((cur_valid.shape[0], 5), device=cur_valid.device)) * cur_valid.unsqueeze(-1)
+        teacher_word_mask = chunk.get('teacher_word_dim_mask')
+        if teacher_word_mask is None:
+            teacher_word_mask = chunk.get(
+                'teacher_word_mask',
+                torch.zeros_like(valid_mask),
+            ).unsqueeze(-1)
+        teacher_word_mask = teacher_word_mask * valid_mask.unsqueeze(-1)
         beta_prefix = (chunk['coverage_ratio'].clamp(0.0, 1.0) ** 2) * teacher_mask
         beta_prefix_dim = beta_prefix.unsqueeze(-1) * teacher_dim_mask
 
@@ -328,7 +335,11 @@ def compute_sequential_losses(model, batch, args):
             'abstention': masked_bce_with_logits(out['abstention_logit'], chunk['abstention_target'], chunk['abstention_loss_mask'] * valid_mask),
             'calibration': masked_mse(out['confidence'].squeeze(-1), chunk['confidence_target'], chunk['confidence_loss_mask'] * valid_mask),
             'teacher_score': masked_mse(out['utt_scores'], chunk.get('teacher_prefix_utt_score', torch.zeros_like(out['utt_scores'])), teacher_dim_mask)
-            + masked_mse(out['word_scores'], chunk.get('teacher_word_score', torch.zeros_like(out['word_scores'])), chunk.get('teacher_word_mask', torch.zeros_like(valid_mask)) * valid_mask),
+            + masked_mse(
+                out['word_scores'],
+                chunk.get('teacher_word_score', torch.zeros_like(out['word_scores'])),
+                teacher_word_mask,
+            ),
             'prefix_kd': masked_mse(out['utt_scores'], chunk.get('teacher_final_utt_score', torch.zeros_like(out['utt_scores'])), beta_prefix_dim),
             'rank': pairwise_rank_loss(out['utt_scores'], chunk.get('teacher_final_utt_score', torch.zeros_like(out['utt_scores'])), teacher_mask, args.rank_margin),
         }

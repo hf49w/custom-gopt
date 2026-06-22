@@ -3,6 +3,7 @@ import gc
 import json
 import math
 import os
+import pickle
 import re
 import shutil
 from collections import Counter
@@ -27,7 +28,6 @@ from build_streaming_asr_gopt_data import (
     align_gold_utterance,
     build_phone_vocab,
     build_word_lexicon,
-    find_repeated_ngram,
     lcs_align_words,
     select_visible_frames,
 )
@@ -74,6 +74,11 @@ def get_args():
     parser.add_argument('--asr-repeat-token-ratio', type=float, default=0.5)
     parser.add_argument('--max-seq-len', type=int, default=0, help='0 means infer from generated PCN slots.')
     parser.add_argument('--target-splits', type=str, default='train,val,test')
+    parser.add_argument('--resume', action='store_true', help='Reuse per-utterance progress files already written under output-dir/progress.')
+    parser.add_argument('--finalize-only', action='store_true', help='Only merge existing progress files into NPZ/manifest outputs.')
+    parser.add_argument('--skip-finalize', action='store_true', help='Only write per-utterance progress files; do not build final NPZ/manifest outputs.')
+    parser.add_argument('--num-shards', type=int, default=1, help='Number of utterance shards for this generation run.')
+    parser.add_argument('--shard-index', type=int, default=0, help='Shard index to process, in [0, num-shards).')
     parser.add_argument('--overwrite', action='store_true')
     return parser.parse_args()
 
@@ -89,10 +94,61 @@ def parse_target_splits(raw_value):
     return selected
 
 
+def validate_shard_args(args):
+    if args.num_shards < 1:
+        raise ValueError('--num-shards must be >= 1.')
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError('--shard-index must satisfy 0 <= shard-index < num-shards.')
+    if args.finalize_only and args.skip_finalize:
+        raise ValueError('--finalize-only and --skip-finalize cannot be used together.')
+
+
+def progress_path(output_dir, split_name, utt_id):
+    return output_dir / 'progress' / split_name / f'{utt_id}.pkl'
+
+
+def write_progress_record(path, record):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp_path, 'wb') as handle:
+        pickle.dump(record, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def read_progress_record(path):
+    with open(path, 'rb') as handle:
+        return pickle.load(handle)
+
+
+def make_progress_record(split_name, utterance_index, utt_id, audio_path, status, examples=None, skipped_chunks=None, skip_record=None):
+    return {
+        'schema': PCN_SCHEMA,
+        'pcn_type': PCN_TYPE,
+        'split': split_name,
+        'utterance_index': int(utterance_index),
+        'utt_id': utt_id,
+        'audio_path': str(audio_path),
+        'status': status,
+        'examples': examples or [],
+        'skipped_chunks': skipped_chunks or [],
+        'skip_record': skip_record,
+    }
+
+
 def softmax_1d(values):
     arr = np.asarray(values, dtype=np.float64)
     if arr.size == 0:
         return arr.astype(np.float32)
+    pos_inf = np.isposinf(arr)
+    if np.any(pos_inf):
+        out = np.zeros_like(arr, dtype=np.float64)
+        out[pos_inf] = 1.0 / float(np.sum(pos_inf))
+        return out.astype(np.float32)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return np.full(arr.shape, 1.0 / float(arr.size), dtype=np.float32)
+    min_finite = np.min(arr[finite])
+    arr = np.where(finite, arr, min_finite - 50.0)
     arr = arr - np.max(arr)
     exp_arr = np.exp(arr)
     return (exp_arr / np.clip(exp_arr.sum(), EPS, None)).astype(np.float32)
@@ -137,6 +193,92 @@ def safe_json(value):
     if isinstance(value, (np.floating, np.integer)):
         return value.item()
     return value
+
+
+def non_overlapping_occurrences(tokens, pattern):
+    positions = []
+    pattern_size = len(pattern)
+    cursor = 0
+    while cursor <= len(tokens) - pattern_size:
+        if tokens[cursor : cursor + pattern_size] == pattern:
+            positions.append(cursor)
+            cursor += pattern_size
+        else:
+            cursor += 1
+    return positions
+
+
+def find_repeated_ngram(
+    words,
+    min_repeats,
+    max_ngram_size=12,
+    strict=False,
+    min_coverage=0.6,
+    dominant_token_ratio=0.5,
+):
+    if min_repeats <= 0:
+        return None
+    tokens = [str(word['text']) for word in words]
+    if not tokens:
+        return None
+
+    for ngram_size in range(1, min(max_ngram_size, len(tokens)) + 1):
+        span = ngram_size * min_repeats
+        for start in range(0, len(tokens) - span + 1):
+            pattern = tokens[start : start + ngram_size]
+            repeats = 1
+            cursor = start + ngram_size
+            while tokens[cursor : cursor + ngram_size] == pattern:
+                repeats += 1
+                cursor += ngram_size
+            if repeats >= min_repeats:
+                return {
+                    'start': int(start),
+                    'ngram_size': int(ngram_size),
+                    'repeats': int(repeats),
+                    'pattern': pattern,
+                    'detection': 'contiguous_cycle',
+                }
+
+    if not strict:
+        return None
+
+    token_counts = Counter(tokens)
+    dominant_token, dominant_count = token_counts.most_common(1)[0]
+    token_ratio = float(dominant_count) / float(len(tokens))
+    if dominant_count >= max(min_repeats * 2, 8) and token_ratio >= dominant_token_ratio:
+        return {
+            'start': None,
+            'ngram_size': 1,
+            'repeats': int(dominant_count),
+            'pattern': [dominant_token],
+            'coverage': token_ratio,
+            'detection': 'dominant_token',
+        }
+
+    max_size = min(max_ngram_size, len(tokens) // max(min_repeats, 1))
+    for ngram_size in range(max_size, 1, -1):
+        candidates = Counter(
+            tuple(tokens[start : start + ngram_size])
+            for start in range(0, len(tokens) - ngram_size + 1)
+        )
+        for pattern, raw_count in candidates.most_common():
+            if raw_count < min_repeats:
+                break
+            positions = non_overlapping_occurrences(tokens, list(pattern))
+            if len(positions) < min_repeats:
+                continue
+            coverage = float(len(positions) * ngram_size) / float(len(tokens))
+            if coverage >= min_coverage:
+                return {
+                    'start': int(positions[0]),
+                    'ngram_size': int(ngram_size),
+                    'repeats': int(len(positions)),
+                    'pattern': list(pattern),
+                    'coverage': coverage,
+                    'detection': 'high_coverage_periodicity',
+                }
+    return None
 
 
 class PhoneMapper:
@@ -200,6 +342,7 @@ class WhisperNBestGenerator:
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name, torch_dtype=torch_dtype)
         self.model.to(device)
         self.model.eval()
+        self.model_dtype = next(self.model.parameters()).dtype
         self.language = language
         self.device = device
         self.nbest = int(nbest)
@@ -225,6 +368,9 @@ class WhisperNBestGenerator:
             return_attention_mask=True,
         )
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        for key in ('input_features', 'input_values'):
+            if key in inputs and torch.is_floating_point(inputs[key]):
+                inputs[key] = inputs[key].to(dtype=self.model_dtype)
         generate_kwargs = {
             'num_beams': self.beam_size,
             'num_return_sequences': self.nbest,
@@ -238,18 +384,27 @@ class WhisperNBestGenerator:
         if self.forced_decoder_ids is not None:
             generate_kwargs['forced_decoder_ids'] = self.forced_decoder_ids
         output = self.model.generate(**inputs, **generate_kwargs)
-        sequences = output.sequences
-        texts = self.processor.batch_decode(sequences, skip_special_tokens=True)
-        if getattr(output, 'sequences_scores', None) is not None:
-            sequence_scores = output.sequences_scores.detach().float().cpu().numpy().tolist()
+        if torch.is_tensor(output):
+            sequences = output
+            sequence_scores = [0.0 for _ in range(int(sequences.shape[0]))]
+            transition_scores = []
         else:
-            sequence_scores = [0.0 for _ in texts]
-        transition_scores = self._transition_scores(output)
+            sequences = output.sequences
+            if getattr(output, 'sequences_scores', None) is not None:
+                sequence_scores = output.sequences_scores.detach().float().cpu().numpy().tolist()
+            else:
+                sequence_scores = [0.0 for _ in range(int(sequences.shape[0]))]
+            transition_scores = self._transition_scores(output)
+        texts = self.processor.batch_decode(sequences, skip_special_tokens=True)
 
         rows = []
         for rank, (text, sequence_score) in enumerate(zip(texts, sequence_scores)):
             token_ids = sequences[rank].detach().cpu().tolist()
-            token_logprobs = transition_scores[rank] if rank < len(transition_scores) else [float(sequence_score)]
+            token_logprobs = (
+                transition_scores[rank]
+                if rank < len(transition_scores)
+                else [float(sequence_score) for _ in token_ids]
+            )
             token_rows, word_rows = self._token_word_scores(token_ids, token_logprobs)
             words = [row['word'] for row in word_rows]
             length_norm = (
@@ -278,16 +433,38 @@ class WhisperNBestGenerator:
         return rows
 
     def _transition_scores(self, output):
-        if not hasattr(self.model, 'compute_transition_scores') or getattr(output, 'scores', None) is None:
+        if getattr(output, 'scores', None) is None:
             return []
         try:
-            scores = self.model.compute_transition_scores(
-                output.sequences,
-                output.scores,
-                getattr(output, 'beam_indices', None),
-                normalize_logits=True,
-            )
-            return scores.detach().float().cpu().numpy().tolist()
+            sequences = output.sequences.detach().cpu()
+            step_scores = [score.detach().float().cpu() for score in output.scores]
+            if not step_scores:
+                return []
+            beam_indices = getattr(output, 'beam_indices', None)
+            if beam_indices is not None:
+                beam_indices = beam_indices.detach().cpu()
+            generated_steps = len(step_scores)
+            start = max(0, int(sequences.shape[1]) - generated_steps)
+            rows = []
+            for seq_idx in range(int(sequences.shape[0])):
+                cur = []
+                for step, logits in enumerate(step_scores):
+                    token_pos = start + step
+                    if token_pos >= int(sequences.shape[1]):
+                        break
+                    token_id = int(sequences[seq_idx, token_pos])
+                    if token_id < 0 or token_id >= int(logits.shape[-1]):
+                        cur.append(0.0)
+                        continue
+                    score_row = min(seq_idx, int(logits.shape[0]) - 1)
+                    if beam_indices is not None and seq_idx < int(beam_indices.shape[0]) and token_pos < int(beam_indices.shape[1]):
+                        candidate = int(beam_indices[seq_idx, token_pos])
+                        if 0 <= candidate < int(logits.shape[0]):
+                            score_row = candidate
+                    log_probs = torch.log_softmax(logits[score_row], dim=-1)
+                    cur.append(float(log_probs[token_id].item()))
+                rows.append(cur)
+            return rows
         except Exception:
             return []
 
@@ -1368,6 +1545,146 @@ def build_split(split_name, split_items, scores, charsiu, asr_generator, phone_m
     return examples, skipped, skipped_chunks
 
 
+def build_split_incremental(
+    split_name,
+    split_items,
+    scores,
+    charsiu,
+    asr_generator,
+    phone_mapper,
+    phn_dict,
+    phone_to_frame_id,
+    args,
+    output_dir,
+):
+    indexed_items = [
+        (utterance_index, utt_id, audio_path)
+        for utterance_index, (utt_id, audio_path) in enumerate(split_items)
+        if utterance_index % args.num_shards == args.shard_index
+    ]
+    processed = 0
+    resumed = 0
+    for utterance_index, utt_id, audio_path in tqdm(indexed_items, desc=f'{split_name}-pcn-shard{args.shard_index}', total=len(indexed_items)):
+        record_path = progress_path(output_dir, split_name, utt_id)
+        if args.resume and record_path.exists():
+            try:
+                record = read_progress_record(record_path)
+                if record.get('schema') == PCN_SCHEMA and record.get('status') in {'ok', 'skipped'}:
+                    resumed += 1
+                    continue
+            except Exception:
+                pass
+
+        aligned = align_gold_utterance(
+            utt_id=utt_id,
+            audio_path=audio_path,
+            scores=scores,
+            charsiu=charsiu,
+            sample_rate=args.sample_rate,
+            device=args.device,
+            phone_to_frame_id=phone_to_frame_id,
+            phn_dict=phn_dict,
+        )
+        if 'skip_reason' in aligned:
+            record = make_progress_record(
+                split_name=split_name,
+                utterance_index=utterance_index,
+                utt_id=utt_id,
+                audio_path=audio_path,
+                status='skipped',
+                skip_record=aligned,
+            )
+            write_progress_record(record_path, record)
+            processed += 1
+            continue
+
+        try:
+            cur_examples, cur_skipped_chunks = build_examples_for_utterance(
+                item=aligned,
+                asr_generator=asr_generator,
+                phone_mapper=phone_mapper,
+                phn_dict=phn_dict,
+                phone_to_frame_id=phone_to_frame_id,
+                args=args,
+                utterance_index=utterance_index,
+            )
+            record = make_progress_record(
+                split_name=split_name,
+                utterance_index=utterance_index,
+                utt_id=utt_id,
+                audio_path=audio_path,
+                status='ok',
+                examples=cur_examples,
+                skipped_chunks=cur_skipped_chunks,
+            )
+        except Exception as exc:
+            record = make_progress_record(
+                split_name=split_name,
+                utterance_index=utterance_index,
+                utt_id=utt_id,
+                audio_path=audio_path,
+                status='skipped',
+                skip_record={'utt_id': utt_id, 'skip_reason': f'pcn_build_failed:{exc}'},
+            )
+        write_progress_record(record_path, record)
+        processed += 1
+    return {
+        'split': split_name,
+        'shard_index': int(args.shard_index),
+        'num_shards': int(args.num_shards),
+        'assigned_utterances': int(len(indexed_items)),
+        'processed_utterances': int(processed),
+        'resumed_utterances': int(resumed),
+    }
+
+
+def collect_split_progress(split_name, split_items, output_dir):
+    examples = []
+    skipped = []
+    skipped_chunks = []
+    missing = []
+    malformed = []
+    status_counter = Counter()
+    for utterance_index, (utt_id, audio_path) in enumerate(split_items):
+        record_file = progress_path(output_dir, split_name, utt_id)
+        if not record_file.exists():
+            missing.append({'utt_id': utt_id, 'utterance_index': int(utterance_index), 'audio_path': str(audio_path)})
+            continue
+        try:
+            record = read_progress_record(record_file)
+        except Exception as exc:
+            malformed.append({'utt_id': utt_id, 'utterance_index': int(utterance_index), 'error': str(exc)})
+            continue
+        if record.get('schema') != PCN_SCHEMA:
+            malformed.append({
+                'utt_id': utt_id,
+                'utterance_index': int(utterance_index),
+                'error': f"unexpected_schema:{record.get('schema')}",
+            })
+            continue
+        status = record.get('status', 'unknown')
+        status_counter[status] += 1
+        if status == 'ok':
+            examples.extend(record.get('examples', []) or [])
+            skipped_chunks.extend(record.get('skipped_chunks', []) or [])
+        else:
+            skipped.append(record.get('skip_record') or {'utt_id': utt_id, 'skip_reason': status})
+    summary = {
+        'split': split_name,
+        'expected_utterances': int(len(split_items)),
+        'ok_utterances': int(status_counter.get('ok', 0)),
+        'skipped_utterances': int(status_counter.get('skipped', 0)),
+        'missing_utterances': int(len(missing)),
+        'malformed_utterances': int(len(malformed)),
+        'examples': int(len(examples)),
+        'skipped_chunks': int(len(skipped_chunks)),
+        'missing_examples': missing[:20],
+        'malformed_examples': malformed[:20],
+        'status_counter': dict(status_counter),
+    }
+    return examples, skipped, skipped_chunks, summary
+
+
 def infer_seq_len(examples, max_seq_len):
     longest = max((example['cn_post'].shape[0] for example in examples), default=0)
     if longest <= 0:
@@ -1601,12 +1918,13 @@ def save_split(split_name, arrays, output_dir):
 def main():
     args = get_args()
     args.device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    validate_shard_args(args)
     target_splits = parse_target_splits(args.target_splits)
     output_dir = Path(args.output_dir)
     if output_dir.exists() and args.overwrite:
         shutil.rmtree(output_dir)
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f'{output_dir} already exists. Use --overwrite to rebuild.')
+    if output_dir.exists() and any(output_dir.iterdir()) and not (args.resume or args.finalize_only):
+        raise FileExistsError(f'{output_dir} already exists. Use --overwrite to rebuild or --resume to continue.')
     output_dir.mkdir(parents=True, exist_ok=True)
 
     scores_path = Path(args.scores_json)
@@ -1630,44 +1948,96 @@ def main():
     lexicon = build_word_lexicon(scores, utt_ids)
     phone_mapper = PhoneMapper(lexicon, phn_dict)
 
-    charsiu = load_official_charsiu_aligner(
-        model_name=args.aligner_model,
-        device=args.device,
-        sample_rate=args.sample_rate,
-        sil_threshold=args.min_sil_frames,
-        lang=args.charsiu_lang,
-        charsiu_src_dir=args.charsiu_src_dir,
-    )
-    phone_to_frame_id, id2label, silence_ids = build_model_phone_map(charsiu)
-    asr_generator = WhisperNBestGenerator(
-        model_name=args.asr_model,
-        language=args.language,
-        device=args.device,
-        nbest=args.nbest,
-        beam_size=args.beam_size,
-        max_new_tokens=args.asr_max_new_tokens,
-        no_repeat_ngram_size=args.asr_no_repeat_ngram_size,
-    )
+    progress_generation_summary = {}
+    if not args.finalize_only:
+        charsiu = load_official_charsiu_aligner(
+            model_name=args.aligner_model,
+            device=args.device,
+            sample_rate=args.sample_rate,
+            sil_threshold=args.min_sil_frames,
+            lang=args.charsiu_lang,
+            charsiu_src_dir=args.charsiu_src_dir,
+        )
+        phone_to_frame_id, id2label, silence_ids = build_model_phone_map(charsiu)
+        asr_generator = WhisperNBestGenerator(
+            model_name=args.asr_model,
+            language=args.language,
+            device=args.device,
+            nbest=args.nbest,
+            beam_size=args.beam_size,
+            max_new_tokens=args.asr_max_new_tokens,
+            no_repeat_ngram_size=args.asr_no_repeat_ngram_size,
+        )
+
+        for split_name in target_splits:
+            progress_generation_summary[split_name] = build_split_incremental(
+                split_name=split_name,
+                split_items=split_items[split_name],
+                scores=scores,
+                charsiu=charsiu,
+                asr_generator=asr_generator,
+                phone_mapper=phone_mapper,
+                phn_dict=phn_dict,
+                phone_to_frame_id=phone_to_frame_id,
+                args=args,
+                output_dir=output_dir,
+            )
+
+    if args.skip_finalize:
+        progress_summary = {
+            split_name: collect_split_progress(split_name, split_items[split_name], output_dir)[3]
+            for split_name in target_splits
+        }
+        with open(output_dir / 'progress_summary.json', 'w', encoding='utf-8') as handle:
+            json.dump(
+                safe_json({
+                    'schema': PCN_SCHEMA,
+                    'pcn_type': PCN_TYPE,
+                    'generation': progress_generation_summary,
+                    'progress': progress_summary,
+                }),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+        return
 
     split_examples = {}
     skipped = {}
+    progress_summary = {}
     all_examples = []
+    incomplete = []
     for split_name in target_splits:
-        examples, cur_skipped, cur_skipped_chunks = build_split(
+        examples, cur_skipped, cur_skipped_chunks, cur_progress_summary = collect_split_progress(
             split_name=split_name,
             split_items=split_items[split_name],
-            scores=scores,
-            charsiu=charsiu,
-            asr_generator=asr_generator,
-            phone_mapper=phone_mapper,
-            phn_dict=phn_dict,
-            phone_to_frame_id=phone_to_frame_id,
-            args=args,
+            output_dir=output_dir,
         )
         split_examples[split_name] = examples
         skipped[split_name] = cur_skipped
         skipped[f'{split_name}_chunks'] = cur_skipped_chunks
+        progress_summary[split_name] = cur_progress_summary
         all_examples.extend(examples)
+        if cur_progress_summary['missing_utterances'] > 0 or cur_progress_summary['malformed_utterances'] > 0:
+            incomplete.append(cur_progress_summary)
+    if incomplete:
+        with open(output_dir / 'progress_summary.json', 'w', encoding='utf-8') as handle:
+            json.dump(
+                safe_json({
+                    'schema': PCN_SCHEMA,
+                    'pcn_type': PCN_TYPE,
+                    'generation': progress_generation_summary,
+                    'progress': progress_summary,
+                }),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+        raise RuntimeError(
+            'Progress is incomplete; not finalizing partial data. '
+            f'See {output_dir / "progress_summary.json"}. '
+            'Continue with --resume, or run all shards then --finalize-only.'
+        )
 
     seq_len = infer_seq_len(all_examples, args.max_seq_len)
     phone_dim = len(phn_dict) + 1
@@ -1703,6 +2073,12 @@ def main():
         'scores_json': str(scores_path),
         'split_meta': split_meta,
         'target_splits': target_splits,
+        'progress': progress_summary,
+        'progress_generation': progress_generation_summary,
+        'resume_enabled': bool(args.resume),
+        'finalize_only': bool(args.finalize_only),
+        'num_shards': int(args.num_shards),
+        'shard_index': int(args.shard_index),
         'aligner_model': args.aligner_model,
         'asr_model': args.asr_model,
         'nbest': int(args.nbest),
