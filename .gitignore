@@ -19,12 +19,22 @@ src/get_summary.py
 TODO.txt
 *result_old.csv
 tmp_*.sh
+tmp_*.py
+*.bak_asracc
+server_synced_state_distill/*
 figure/*
 !figure/gopt_poster.png
 colab/GOPT_old.ipynb
 exp/*
 server_assets/*
 scripts/server/server_paths.env
+scripts/server/server_paths_*.env
+/run_streaming_whisper_gopt_wsl.sh
+/train_on_server.sh
+/upload_assets_to_server.sh
+/server_paths.env.example
+/run_selected_multipa_server.py
+
 # model weights
 *.bin
 *.safetensors
@@ -39,6 +49,4 @@ hf_bundle/**/whisper_best_model/
 hf_bundle/**/charsiu_en_w2v2_tiny_fc_10ms/
 
 # caches / logs
-__pycache__/
-*.pyc
 *.log

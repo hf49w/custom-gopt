@@ -38,6 +38,18 @@ def load_wav_map(dataset_root):
     return wav_map
 
 
+def mean_numeric(values, default=0.0):
+    if not isinstance(values, list) or not values:
+        return default
+    numeric = []
+    for value in values:
+        if isinstance(value, (int, float)):
+            numeric.append(float(value))
+    if not numeric:
+        return default
+    return sum(numeric) / len(numeric)
+
+
 def main():
     args = parse_args()
     scores = json.loads(args.scores_json.read_text(encoding="utf-8"))
@@ -89,10 +101,30 @@ def main():
                 "duration": duration,
                 "progress": min(1.0, float(row["commit_time"]) / max(duration, 1e-8)),
                 "is_final": bool(row["is_final"]),
-                "visible_phone_count": int(row["visible_phone_count"]),
-                "committed_phone_count": int(row["committed_phone_count"]),
-                "matched_ratio": float(row["matched_ratio"]),
-                "mean_asr_confidence": float(row.get("mean_asr_confidence", 0.0)),
+                "visible_phone_count": int(
+                    row.get(
+                        "visible_phone_count",
+                        row.get("visible_len", row.get("top_phone_count", 0)),
+                    )
+                ),
+                "committed_phone_count": int(
+                    row.get(
+                        "committed_phone_count",
+                        row.get("visible_len", row.get("top_phone_count", 0)),
+                    )
+                ),
+                "matched_ratio": float(
+                    row.get("matched_ratio", row.get("coverage_ratio", 0.0))
+                ),
+                "mean_asr_confidence": float(
+                    row.get(
+                        "mean_asr_confidence",
+                        mean_numeric(
+                            row.get("word_confidences"),
+                            mean_numeric(row.get("token_confidences"), 0.0),
+                        ),
+                    )
+                ),
                 "wav_path": wav_map[utt_id],
                 "reference_text": target["text"],
                 "target_scores": {

@@ -36,14 +36,6 @@ GOPT_DATA_FINALIZE_DEVICE="${GOPT_DATA_FINALIZE_DEVICE:-cpu}"
 ASR_BATCH_SIZE="${ASR_BATCH_SIZE:-4}"
 ASR_MIN_BATCH_SIZE="${ASR_MIN_BATCH_SIZE:-1}"
 ASR_MAX_NEW_TOKENS="${ASR_MAX_NEW_TOKENS:-128}"
-ASR_NO_REPEAT_NGRAM_SIZE="${ASR_NO_REPEAT_NGRAM_SIZE:-0}"
-ASR_MAX_WORDS="${ASR_MAX_WORDS:-64}"
-ASR_MAX_VISIBLE_PHONES="${ASR_MAX_VISIBLE_PHONES:-100}"
-ASR_MAX_PHONE_RATIO="${ASR_MAX_PHONE_RATIO:-3.0}"
-ASR_REPEAT_NGRAM_MIN_REPEATS="${ASR_REPEAT_NGRAM_MIN_REPEATS:-4}"
-ASR_REPEAT_MAX_NGRAM_SIZE="${ASR_REPEAT_MAX_NGRAM_SIZE:-12}"
-ASR_REPEAT_NGRAM_COVERAGE="${ASR_REPEAT_NGRAM_COVERAGE:-0.6}"
-ASR_REPEAT_TOKEN_RATIO="${ASR_REPEAT_TOKEN_RATIO:-0.5}"
 ASR_TORCH_DTYPE="${ASR_TORCH_DTYPE:-auto}"
 ASR_USE_CACHE="${ASR_USE_CACHE:-0}"
 ASR_EMPTY_CACHE="${ASR_EMPTY_CACHE:-1}"
@@ -187,14 +179,6 @@ run_asr_gopt_data() {
     --asr-batch-size "${ASR_BATCH_SIZE}"
     --asr-min-batch-size "${ASR_MIN_BATCH_SIZE}"
     --asr-max-new-tokens "${ASR_MAX_NEW_TOKENS}"
-    --asr-no-repeat-ngram-size "${ASR_NO_REPEAT_NGRAM_SIZE}"
-    --asr-max-words "${ASR_MAX_WORDS}"
-    --asr-max-visible-phones "${ASR_MAX_VISIBLE_PHONES}"
-    --asr-max-phone-ratio "${ASR_MAX_PHONE_RATIO}"
-    --asr-repeat-ngram-min-repeats "${ASR_REPEAT_NGRAM_MIN_REPEATS}"
-    --asr-repeat-max-ngram-size "${ASR_REPEAT_MAX_NGRAM_SIZE}"
-    --asr-repeat-ngram-coverage "${ASR_REPEAT_NGRAM_COVERAGE}"
-    --asr-repeat-token-ratio "${ASR_REPEAT_TOKEN_RATIO}"
     --asr-torch-dtype "${ASR_TORCH_DTYPE}"
   )
 
@@ -230,14 +214,6 @@ run_asr_gopt_data() {
         --asr-batch-size "${ASR_BATCH_SIZE}" \
         --asr-min-batch-size "${ASR_MIN_BATCH_SIZE}" \
         --asr-max-new-tokens "${ASR_MAX_NEW_TOKENS}" \
-        --asr-no-repeat-ngram-size "${ASR_NO_REPEAT_NGRAM_SIZE}" \
-        --asr-max-words "${ASR_MAX_WORDS}" \
-        --asr-max-visible-phones "${ASR_MAX_VISIBLE_PHONES}" \
-        --asr-max-phone-ratio "${ASR_MAX_PHONE_RATIO}" \
-        --asr-repeat-ngram-min-repeats "${ASR_REPEAT_NGRAM_MIN_REPEATS}" \
-        --asr-repeat-max-ngram-size "${ASR_REPEAT_MAX_NGRAM_SIZE}" \
-        --asr-repeat-ngram-coverage "${ASR_REPEAT_NGRAM_COVERAGE}" \
-        --asr-repeat-token-ratio "${ASR_REPEAT_TOKEN_RATIO}" \
         --asr-torch-dtype "${ASR_TORCH_DTYPE}" \
         --device cuda \
         --num-shards "${#gpu_ids[@]}" \
@@ -298,14 +274,6 @@ run_asr_gopt_data() {
     --asr-batch-size "${ASR_BATCH_SIZE}" \
     --asr-min-batch-size "${ASR_MIN_BATCH_SIZE}" \
     --asr-max-new-tokens "${ASR_MAX_NEW_TOKENS}" \
-    --asr-no-repeat-ngram-size "${ASR_NO_REPEAT_NGRAM_SIZE}" \
-    --asr-max-words "${ASR_MAX_WORDS}" \
-    --asr-max-visible-phones "${ASR_MAX_VISIBLE_PHONES}" \
-    --asr-max-phone-ratio "${ASR_MAX_PHONE_RATIO}" \
-    --asr-repeat-ngram-min-repeats "${ASR_REPEAT_NGRAM_MIN_REPEATS}" \
-    --asr-repeat-max-ngram-size "${ASR_REPEAT_MAX_NGRAM_SIZE}" \
-    --asr-repeat-ngram-coverage "${ASR_REPEAT_NGRAM_COVERAGE}" \
-    --asr-repeat-token-ratio "${ASR_REPEAT_TOKEN_RATIO}" \
     --asr-torch-dtype "${ASR_TORCH_DTYPE}" \
     "${device_args[@]}" \
     "${extra_args[@]}" \

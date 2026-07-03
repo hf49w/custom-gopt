@@ -81,8 +81,10 @@ def main():
                 "chunk_id": int(row["chunk_id"]),
                 "commit_time": float(row["commit_time"]),
                 "audio_end": float(row["audio_end"]),
-                "matched_ratio": float(row["matched_ratio"]),
-                "utt_loss_mask": float(row["utt_loss_mask"]),
+                "matched_ratio": float(
+                    row.get("matched_ratio", row.get("coverage_ratio", 0.0))
+                ),
+                "utt_loss_mask": float(row.get("utt_loss_mask", 1.0)),
             },
         }
         records.append(record)

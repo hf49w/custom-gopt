@@ -151,6 +151,18 @@ def pad_mismatch_sequence(gt_words, pred_words, pred_acc, pred_stress, pred_tota
     return padded_acc, padded_stress, padded_total
 
 
+def fit_score_length(values, target_len: int):
+    if isinstance(values, (float, int)):
+        return [float(values) for _ in range(target_len)]
+    values = list(values)
+    if len(values) == target_len:
+        return values
+    if len(values) > target_len:
+        return values[:target_len]
+    pad_value = values[-1] if values else 0.0
+    return values + [pad_value for _ in range(target_len - len(values))]
+
+
 def align_two_sentences(result_gt, result_asr):
     asr_wordidx_list = []
     for gt_value in result_gt:
@@ -254,6 +266,10 @@ def evaluate_predictions(prediction_path: Path, test_data: Dict[str, Dict], gt_a
             gt_w_acc.extend(align_gt_w_acc)
             gt_w_stress.extend(align_gt_w_stress)
             gt_w_total.extend(align_gt_w_total)
+            target_len = len(align_gt_w_acc)
+            the_pred_w_acc = fit_score_length(the_pred_w_acc, target_len)
+            the_pred_w_stress = fit_score_length(the_pred_w_stress, target_len)
+            the_pred_w_total = fit_score_length(the_pred_w_total, target_len)
             pred_w_acc.extend(the_pred_w_acc)
             pred_w_stress.extend(the_pred_w_stress)
             pred_w_total.extend(the_pred_w_total)
@@ -262,6 +278,10 @@ def evaluate_predictions(prediction_path: Path, test_data: Dict[str, Dict], gt_a
                 the_pred_w_acc, the_pred_w_stress, the_pred_w_total = pad_mismatch_sequence(
                     the_gt_w_text, result_word[wavidx]["text"], the_pred_w_acc, the_pred_w_stress, the_pred_w_total
                 )
+            target_len = len(the_gt_w_acc)
+            the_pred_w_acc = fit_score_length(the_pred_w_acc, target_len)
+            the_pred_w_stress = fit_score_length(the_pred_w_stress, target_len)
+            the_pred_w_total = fit_score_length(the_pred_w_total, target_len)
             gt_w_acc.extend(the_gt_w_acc)
             gt_w_stress.extend(the_gt_w_stress)
             gt_w_total.extend(the_gt_w_total)

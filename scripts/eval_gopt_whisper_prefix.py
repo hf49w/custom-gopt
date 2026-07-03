@@ -25,6 +25,15 @@ def parse_args():
     parser.add_argument("--repo-src", type=Path, required=True)
     parser.add_argument("--asr-model-name", required=True)
     parser.add_argument("--output-jsonl", type=Path, required=True)
+    parser.add_argument(
+        "--pseudo-scores-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional pseudo scores.json produced by prepare_gopt_open_dataset.py. "
+            "Used only to annotate ASR word/phone text in the output JSONL."
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=128)
     return parser.parse_args()
@@ -62,20 +71,80 @@ def normalize_features(feat):
     return output
 
 
-def aggregate_words(word_pred, word_target):
+def infer_pseudo_scores_path(seq_data_dir):
+    candidates = [
+        seq_data_dir.parent / "prepared_dataset" / "resource" / "scores.json",
+        seq_data_dir / "scores.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def load_pseudo_scores(path):
+    if path is None or not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def flatten_phone_metadata(pseudo_scores, utt_id):
+    item = pseudo_scores.get(str(utt_id), {})
+    phones = []
+    for word_id, word in enumerate(item.get("words") or []):
+        for phone_in_word, phone in enumerate(word.get("phones") or []):
+            phones.append(
+                {
+                    "word_id": int(word_id),
+                    "word": str(word.get("text", "")).lower(),
+                    "phone": str(phone),
+                    "phone_in_word": int(phone_in_word),
+                }
+            )
+    return phones
+
+
+def word_text_metadata(pseudo_scores, utt_id):
+    item = pseudo_scores.get(str(utt_id), {})
+    return [str(word.get("text", "")).lower() for word in item.get("words") or []]
+
+
+def aggregate_phones(phone_pred, phn_target, phone_metadata):
+    rows = []
+    for idx in range(phn_target.shape[0]):
+        phone_id = int(phn_target[idx, 0])
+        if phone_id < 0:
+            continue
+        meta = phone_metadata[idx] if idx < len(phone_metadata) else {}
+        rows.append(
+            {
+                "phone_index": int(idx),
+                "phone_id": phone_id,
+                "phone": meta.get("phone"),
+                "word_id": meta.get("word_id"),
+                "word": meta.get("word"),
+                "phone_in_word": meta.get("phone_in_word"),
+                "pred_accuracy": float(phone_pred[idx, 0]),
+            }
+        )
+    return rows
+
+
+def aggregate_words(word_pred, word_target, word_texts=None):
     word_ids = word_target[:, 3]
     result = []
     for word_id in sorted(set(int(value) for value in word_ids if value >= 0)):
         positions = np.where(word_ids == word_id)[0]
         pred = word_pred[positions].mean(axis=0) * 5.0
-        result.append(
-            {
-                "word_id": word_id,
-                "pred_accuracy": float(pred[0]),
-                "pred_stress": float(pred[1]),
-                "pred_total": float(pred[2]),
-            }
-        )
+        row = {
+            "word_id": word_id,
+            "pred_accuracy": float(pred[0]),
+            "pred_stress": float(pred[1]),
+            "pred_total": float(pred[2]),
+        }
+        if word_texts is not None and word_id < len(word_texts):
+            row["word"] = word_texts[word_id]
+        result.append(row)
     return result
 
 
@@ -100,6 +169,8 @@ def main():
     feat_all = np.load(args.seq_data_dir / "te_feat.npy", mmap_mode="r")
     phn_all = np.load(args.seq_data_dir / "te_label_phn.npy", mmap_mode="r")
     word_all = np.load(args.seq_data_dir / "te_label_word.npy", mmap_mode="r")
+    pseudo_scores_path = args.pseudo_scores_json or infer_pseudo_scores_path(args.seq_data_dir)
+    pseudo_scores = load_pseudo_scores(pseudo_scores_path)
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with args.output_jsonl.open("w", encoding="utf-8") as output:
@@ -123,17 +194,25 @@ def main():
                     outputs = model(x, p)
                 elapsed_per_row = (time.perf_counter() - started) / len(valid_rows)
                 utt_pred = torch.cat(outputs[:5], dim=1).cpu().numpy() * 5.0
+                phone_pred = outputs[5].cpu().numpy()
                 word_pred = torch.cat(outputs[6:9], dim=2).cpu().numpy()
                 for local_index, row in enumerate(valid_rows):
                     seq_index = indices[local_index]
+                    eval_id = row["utt_id"]
                     predictions[row["utt_id"]] = {
                         "scores": {
                             name: float(utt_pred[local_index, score_index])
                             for score_index, name in enumerate(SCORE_NAMES)
                         },
+                        "phone_scores": aggregate_phones(
+                            phone_pred[local_index],
+                            np.asarray(phn_all[seq_index]),
+                            flatten_phone_metadata(pseudo_scores, eval_id),
+                        ),
                         "word_scores": aggregate_words(
                             word_pred[local_index],
                             np.asarray(word_all[seq_index]),
+                            word_text_metadata(pseudo_scores, eval_id),
                         ),
                     }
 

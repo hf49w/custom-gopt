@@ -1,6 +1,5 @@
 import argparse
 import gc
-import inspect
 import json
 import math
 import os
@@ -60,14 +59,6 @@ def get_args():
     parser.add_argument('--asr-batch-size', type=int, default=4, help='Initial batch size used when decoding prefix chunks with the transformers Whisper pipeline.')
     parser.add_argument('--asr-min-batch-size', type=int, default=1, help='Minimum micro-batch size when retrying transformers Whisper decoding after CUDA OOM.')
     parser.add_argument('--asr-max-new-tokens', type=int, default=128, help='Upper bound for Whisper generation length during ASR-driven chunk building.')
-    parser.add_argument('--asr-no-repeat-ngram-size', type=int, default=0, help='Transformers Whisper no-repeat ngram size. Disabled by default; post-decode repetition checks preserve valid repeated phrases.')
-    parser.add_argument('--asr-max-words', type=int, default=64, help='Word-count threshold that enables strict repetition checks. Length alone never rejects a hypothesis. Set 0 to disable the trigger.')
-    parser.add_argument('--asr-max-visible-phones', type=int, default=100, help='ASR-phone threshold that enables strict repetition checks. Length alone never rejects a hypothesis. Set 0 to disable the trigger.')
-    parser.add_argument('--asr-max-phone-ratio', type=float, default=3.0, help='Reject when ASR phones exceed this multiple of reference phones. Set 0 to disable.')
-    parser.add_argument('--asr-repeat-ngram-min-repeats', type=int, default=4, help='Reject a repeated word pattern seen at least this many times. Set 0 to disable.')
-    parser.add_argument('--asr-repeat-max-ngram-size', type=int, default=12, help='Maximum word-pattern length checked for repetition.')
-    parser.add_argument('--asr-repeat-ngram-coverage', type=float, default=0.6, help='Strict-mode minimum fraction covered by repeated non-overlapping ngrams.')
-    parser.add_argument('--asr-repeat-token-ratio', type=float, default=0.5, help='Strict-mode minimum fraction occupied by one repeated token.')
     parser.add_argument('--asr-use-cache', action='store_true', help='Enable Whisper KV-cache during generation. Disabled by default to reduce peak GPU memory.')
     parser.add_argument('--asr-torch-dtype', type=str, default='auto', choices=['auto', 'float16', 'bfloat16', 'float32'], help='Torch dtype for the transformers Whisper pipeline.')
     parser.add_argument('--asr-empty-cache', action='store_true', help='Call torch.cuda.empty_cache() between ASR micro-batches.')
@@ -102,55 +93,6 @@ def build_word_lexicon(scores, utt_ids):
         phones = max(counter.items(), key=lambda item: (item[1], -len(item[0])))[0]
         lexicon[word] = list(phones)
     return lexicon
-
-
-class AsrPhoneCounter:
-    def __init__(self, lexicon):
-        self.lexicon = lexicon
-        self.oov_cache = {}
-        self.g2p = None
-        try:
-            from g2p_en import G2p
-
-            self.g2p = G2p()
-        except Exception:
-            pass
-
-    def count_word(self, word):
-        phones = self.lexicon.get(word)
-        if phones:
-            return len(phones), 'lexicon'
-        if word in self.oov_cache:
-            return self.oov_cache[word]
-
-        if self.g2p is not None:
-            try:
-                g2p_phones = [
-                    normalize_phone(phone)
-                    for phone in self.g2p(word.lower())
-                    if re.fullmatch(r'[A-Za-z]+[0-2]?', str(phone))
-                ]
-                g2p_phones = [phone for phone in g2p_phones if phone]
-                if g2p_phones:
-                    result = (len(g2p_phones), 'g2p_en')
-                    self.oov_cache[word] = result
-                    return result
-            except Exception:
-                self.g2p = None
-
-        letter_count = len(re.sub(r'[^A-Z]', '', normalize_word(word)))
-        result = (max(1, int(math.ceil(letter_count / 3.0))), 'character_estimate')
-        self.oov_cache[word] = result
-        return result
-
-    def count_words(self, words):
-        total = 0
-        source_counts = Counter()
-        for word in words:
-            phone_count, source = self.count_word(str(word['text']))
-            total += phone_count
-            source_counts[source] += 1
-        return total, dict(source_counts)
 
 
 def parse_target_splits(raw_value):
@@ -206,97 +148,6 @@ def longest_common_prefix_len(prev_words, curr_words):
     return idx
 
 
-def non_overlapping_occurrences(tokens, pattern):
-    positions = []
-    pattern_size = len(pattern)
-    cursor = 0
-    while cursor <= len(tokens) - pattern_size:
-        if tokens[cursor : cursor + pattern_size] == pattern:
-            positions.append(cursor)
-            cursor += pattern_size
-        else:
-            cursor += 1
-    return positions
-
-
-def find_repeated_ngram(
-    words,
-    min_repeats,
-    max_ngram_size=12,
-    strict=False,
-    min_coverage=0.6,
-    dominant_token_ratio=0.5,
-):
-    if min_repeats <= 0:
-        return None
-    tokens = [str(word['text']) for word in words]
-    if not tokens:
-        return None
-
-    # Exact adjacent cycles catch the common Whisper failure mode without
-    # treating normal repeated words elsewhere in a long sentence as a loop.
-    for ngram_size in range(1, min(max_ngram_size, len(tokens)) + 1):
-        span = ngram_size * min_repeats
-        for start in range(0, len(tokens) - span + 1):
-            pattern = tokens[start : start + ngram_size]
-            repeats = 1
-            cursor = start + ngram_size
-            while tokens[cursor : cursor + ngram_size] == pattern:
-                repeats += 1
-                cursor += ngram_size
-            if repeats >= min_repeats:
-                return {
-                    'start': int(start),
-                    'ngram_size': int(ngram_size),
-                    'repeats': int(repeats),
-                    'pattern': pattern,
-                    'detection': 'contiguous_cycle',
-                }
-
-    if not strict:
-        return None
-
-    token_counts = Counter(tokens)
-    dominant_token, dominant_count = token_counts.most_common(1)[0]
-    token_ratio = float(dominant_count) / float(len(tokens))
-    if dominant_count >= max(min_repeats * 2, 8) and token_ratio >= dominant_token_ratio:
-        return {
-            'start': None,
-            'ngram_size': 1,
-            'repeats': int(dominant_count),
-            'pattern': [dominant_token],
-            'coverage': token_ratio,
-            'detection': 'dominant_token',
-        }
-
-    # Long outputs receive an additional periodicity check. Occurrences must
-    # be non-overlapping and cover most of the hypothesis, which avoids
-    # rejecting legitimate long sentences that reuse common short phrases.
-    max_size = min(max_ngram_size, len(tokens) // max(min_repeats, 1))
-    for ngram_size in range(max_size, 1, -1):
-        candidates = Counter(
-            tuple(tokens[start : start + ngram_size])
-            for start in range(0, len(tokens) - ngram_size + 1)
-        )
-        for pattern, raw_count in candidates.most_common():
-            if raw_count < min_repeats:
-                break
-            positions = non_overlapping_occurrences(tokens, list(pattern))
-            if len(positions) < min_repeats:
-                continue
-            coverage = float(len(positions) * ngram_size) / float(len(tokens))
-            if coverage >= min_coverage:
-                return {
-                    'start': int(positions[0]),
-                    'ngram_size': int(ngram_size),
-                    'repeats': int(len(positions)),
-                    'pattern': list(pattern),
-                    'coverage': coverage,
-                    'detection': 'high_coverage_periodicity',
-                }
-    return None
-
-
 def lcs_align_words(asr_words, gold_words):
     n = len(asr_words)
     m = len(gold_words)
@@ -335,7 +186,7 @@ def resolve_torch_dtype(device, dtype_name):
     return torch.float16
 
 
-def build_transformers_asr(asr_model, language, device, torch_dtype_name, max_new_tokens, no_repeat_ngram_size, use_cache):
+def build_transformers_asr(asr_model, language, device, torch_dtype_name, max_new_tokens, use_cache):
     if device.startswith('cuda'):
         pipe_device = int(device.split(':', 1)[1]) if ':' in device else 0
     else:
@@ -351,19 +202,14 @@ def build_transformers_asr(asr_model, language, device, torch_dtype_name, max_ne
     )
     if hasattr(pipe.model, 'generation_config'):
         pipe.model.generation_config.use_cache = bool(use_cache)
-    if hasattr(pipe.feature_extractor, 'return_attention_mask'):
-        pipe.feature_extractor.return_attention_mask = True
-    generate_kwargs = {
-        'language': language,
-        'task': 'transcribe',
-        'max_new_tokens': max_new_tokens,
-        'use_cache': bool(use_cache),
-    }
-    if no_repeat_ngram_size > 0:
-        generate_kwargs['no_repeat_ngram_size'] = int(no_repeat_ngram_size)
     return pipe, {
         'return_timestamps': 'word',
-        'generate_kwargs': generate_kwargs,
+        'generate_kwargs': {
+            'language': language,
+            'task': 'transcribe',
+            'max_new_tokens': max_new_tokens,
+            'use_cache': bool(use_cache),
+        },
     }
 
 
@@ -465,23 +311,14 @@ def transcribe_audio_prefixes(audio_prefixes, sample_rate, backend_name, backend
 
     whisper = backend_kwargs['module']
     outputs = []
-    transcribe_parameters = inspect.signature(whisper.transcribe).parameters
-    supports_previous_text_control = (
-        'condition_on_previous_text' in transcribe_parameters
-        or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in transcribe_parameters.values()
-        )
-    )
     for audio_prefix in audio_prefixes:
-        transcribe_kwargs = {
-            'language': language,
-            'beam_size': beam_size,
-            'best_of': best_of,
-        }
-        if supports_previous_text_control:
-            transcribe_kwargs['condition_on_previous_text'] = False
-        result = whisper.transcribe(backend_model, audio_prefix, **transcribe_kwargs)
+        result = whisper.transcribe(
+            backend_model,
+            audio_prefix,
+            language=language,
+            beam_size=beam_size,
+            best_of=best_of,
+        )
         outputs.append(extract_words_from_whisper_timestamped(result))
         if asr_empty_cache:
             clear_cuda_cache()
@@ -528,7 +365,6 @@ def align_gold_utterance(utt_id, audio_path, scores, charsiu, sample_rate, devic
         'frame_step': float(frame_step),
         'probs': probs,
         'keep_mask': keep_mask,
-        'gold_phone_segments': aligned['phones'],
         'word_start_times': word_start_times,
         'word_end_times': word_end_times,
         'gold_words': gold_words,
@@ -548,7 +384,7 @@ def align_split(split_items, scores, charsiu, sample_rate, device, phone_to_fram
     return aligned, skipped
 
 
-def build_chunk_examples_for_utterance(item, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, phn_dict, phone_to_frame_id, asr_phone_counter):
+def build_chunk_examples_for_utterance(item, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, phn_dict, phone_to_frame_id):
     examples = []
     skipped_chunks = []
     chunk_records = []
@@ -608,83 +444,6 @@ def build_chunk_examples_for_utterance(item, asr_backend_name, asr_backend_model
             reason = 'empty_asr_hypothesis'
             skipped_chunks.append({'utt_id': utt_id, 'chunk_id': int(chunk_id), 'reason': reason})
             chunk_records.append({**chunk_base, 'status': 'skipped', 'skip_reason': reason})
-            prev_visible_words = []
-            continue
-
-        alignable_phone_count = sum(
-            len(lexicon.get(word['text'], []))
-            for word in asr_words
-        )
-        asr_phone_count, asr_phone_source_counts = asr_phone_counter.count_words(asr_words)
-        reference_phone_count = sum(len(word['phones']) for word in gold_words)
-        phone_ratio = float(
-            asr_phone_count / max(reference_phone_count, 1)
-        )
-        long_word_trigger = (
-            args.asr_max_words > 0
-            and len(asr_words) > args.asr_max_words
-        )
-        long_phone_trigger = (
-            args.asr_max_visible_phones > 0
-            and asr_phone_count > args.asr_max_visible_phones
-        )
-        strict_repeat_check = bool(long_word_trigger or long_phone_trigger)
-        length_diagnostics = {
-            'asr_word_count': int(len(asr_words)),
-            'asr_phone_count': int(asr_phone_count),
-            'alignable_phone_count': int(alignable_phone_count),
-            'asr_phone_source_counts': asr_phone_source_counts,
-            'reference_phone_count': int(reference_phone_count),
-            'phone_ratio': phone_ratio,
-            'strict_repeat_check': strict_repeat_check,
-            'long_word_trigger': bool(long_word_trigger),
-            'long_phone_trigger': bool(long_phone_trigger),
-        }
-        chunk_base.update(length_diagnostics)
-
-        repeat_info = find_repeated_ngram(
-            asr_words,
-            min_repeats=args.asr_repeat_ngram_min_repeats,
-            max_ngram_size=args.asr_repeat_max_ngram_size,
-            strict=strict_repeat_check,
-            min_coverage=args.asr_repeat_ngram_coverage,
-            dominant_token_ratio=args.asr_repeat_token_ratio,
-        )
-        if repeat_info is not None:
-            reason = 'repetitive_asr_hypothesis'
-            skipped_chunks.append({
-                'utt_id': utt_id,
-                'chunk_id': int(chunk_id),
-                'reason': reason,
-                **length_diagnostics,
-                **repeat_info,
-            })
-            chunk_records.append({
-                **chunk_base,
-                'status': 'skipped',
-                'skip_reason': reason,
-                'repeat_info': repeat_info,
-            })
-            prev_visible_words = []
-            continue
-
-        exceeds_ratio_limit = (
-            args.asr_max_phone_ratio > 0
-            and phone_ratio > args.asr_max_phone_ratio
-        )
-        if exceeds_ratio_limit:
-            reason = 'asr_phone_ratio_outlier'
-            skipped_chunks.append({
-                'utt_id': utt_id,
-                'chunk_id': int(chunk_id),
-                'reason': reason,
-                **length_diagnostics,
-            })
-            chunk_records.append({
-                **chunk_base,
-                'status': 'skipped',
-                'skip_reason': reason,
-            })
             prev_visible_words = []
             continue
 
@@ -857,7 +616,7 @@ def build_chunk_examples_for_utterance(item, asr_backend_name, asr_backend_model
     return examples, skipped_chunks, chunk_records
 
 
-def build_chunk_examples(aligned_items, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, phn_dict, phone_to_frame_id, asr_phone_counter):
+def build_chunk_examples(aligned_items, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, phn_dict, phone_to_frame_id):
     examples = []
     skipped_chunks = []
     chunk_records = []
@@ -871,7 +630,6 @@ def build_chunk_examples(aligned_items, asr_backend_name, asr_backend_model, asr
             lexicon=lexicon,
             phn_dict=phn_dict,
             phone_to_frame_id=phone_to_frame_id,
-            asr_phone_counter=asr_phone_counter,
         )
         examples.extend(cur_examples)
         skipped_chunks.extend(cur_skipped_chunks)
@@ -1155,7 +913,7 @@ def collect_split_progress(split_name, split_items, output_dir):
     }
 
 
-def process_split_with_resume(split_name, split_items, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, asr_phone_counter, output_dir):
+def process_split_with_resume(split_name, split_items, scores, charsiu, sample_rate, device, phone_to_frame_id, phn_dict, asr_backend_name, asr_backend_model, asr_backend_kwargs, args, lexicon, output_dir):
     split_dir = get_progress_split_dir(output_dir, split_name)
     split_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1198,7 +956,6 @@ def process_split_with_resume(split_name, split_items, scores, charsiu, sample_r
             lexicon=lexicon,
             phn_dict=phn_dict,
             phone_to_frame_id=phone_to_frame_id,
-            asr_phone_counter=asr_phone_counter,
         )
         save_progress_record(record_path, {
             'status': 'ok',
@@ -1290,7 +1047,6 @@ def main():
     silence_ids = []
     phone_vocab_preview = []
     if not args.finalize_only:
-        asr_phone_counter = AsrPhoneCounter(lexicon)
         charsiu = load_official_charsiu_aligner(
             model_name=args.aligner_model,
             device=device,
@@ -1321,7 +1077,6 @@ def main():
                 device,
                 args.asr_torch_dtype,
                 args.asr_max_new_tokens,
-                args.asr_no_repeat_ngram_size,
                 args.asr_use_cache,
             )
             asr_backend_name = 'transformers'
@@ -1347,7 +1102,6 @@ def main():
                 asr_backend_kwargs=asr_backend_kwargs,
                 args=args,
                 lexicon=lexicon,
-                asr_phone_counter=asr_phone_counter,
                 output_dir=output_dir,
             )
 
@@ -1453,21 +1207,6 @@ def main():
         'charsiu_lang': args.charsiu_lang,
         'asr_model': args.asr_model,
         'timestamp_backend': args.timestamp_backend,
-        'asr_generation_filters': {
-            'max_new_tokens': int(args.asr_max_new_tokens),
-            'no_repeat_ngram_size': int(args.asr_no_repeat_ngram_size),
-            'strict_repeat_word_trigger': int(args.asr_max_words),
-            'strict_repeat_phone_trigger': int(args.asr_max_visible_phones),
-            'max_phone_ratio': float(args.asr_max_phone_ratio),
-            'repeat_ngram_min_repeats': int(args.asr_repeat_ngram_min_repeats),
-            'repeat_max_ngram_size': int(args.asr_repeat_max_ngram_size),
-            'repeat_ngram_coverage': float(args.asr_repeat_ngram_coverage),
-            'repeat_token_ratio': float(args.asr_repeat_token_ratio),
-            'condition_on_previous_text': False,
-            'length_policy': 'word_count and absolute phone_count only enable strict repetition checks; non-repetitive long hypotheses are retained',
-            'hard_rejection_policy': 'empty hypothesis, detected repetition, or ASR/reference phone ratio above max_phone_ratio',
-            'phone_count_policy': 'reference lexicon first, g2p_en for OOV words, then character-length estimate if G2P is unavailable',
-        },
         'chunk_sec': float(args.chunk_sec),
         'right_context_sec': float(args.right_context_sec),
         'seq_len': int(seq_len),

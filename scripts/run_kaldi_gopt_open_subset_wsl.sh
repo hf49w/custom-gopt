@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 
+abs_path() {
+  python3 -c 'import os, sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$1"
+}
+
 PREPARED_DATASET_ROOT="${PREPARED_DATASET_ROOT:-}"
 KALDI_GOP_ROOT="${KALDI_GOP_ROOT:-${WORKSPACE_ROOT}/kaldi/egs/gop_speechocean762/s5}"
 LIBRISPEECH_EG_ROOT="${LIBRISPEECH_EG_ROOT:-${WORKSPACE_ROOT}/kaldi/egs/librispeech/s5}"
@@ -16,6 +20,10 @@ if [[ -z "${PREPARED_DATASET_ROOT}" ]]; then
   echo "PREPARED_DATASET_ROOT is required" >&2
   exit 1
 fi
+
+PREPARED_DATASET_ROOT="$(abs_path "${PREPARED_DATASET_ROOT}")"
+KALDI_GOP_ROOT="$(abs_path "${KALDI_GOP_ROOT}")"
+LIBRISPEECH_EG_ROOT="$(abs_path "${LIBRISPEECH_EG_ROOT}")"
 
 if [[ ! -d "${PREPARED_DATASET_ROOT}" ]]; then
   echo "Missing PREPARED_DATASET_ROOT: ${PREPARED_DATASET_ROOT}" >&2
