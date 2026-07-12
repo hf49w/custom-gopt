@@ -30,6 +30,12 @@ def parse_args():
     parser.add_argument("--scores-json", type=Path, required=True)
     parser.add_argument("--seq-data-dir", type=Path, required=True)
     parser.add_argument("--keys-phn-csv", type=Path, default=None)
+    parser.add_argument(
+        "--seq-split",
+        choices=["train", "test", "tr", "te"],
+        default="test",
+        help="Sequence array prefix to load from seq-data-dir. train/tr -> tr_*.npy, test/te -> te_*.npy.",
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--repo-src", type=Path, required=True)
     parser.add_argument("--output-jsonl", type=Path, required=True)
@@ -89,8 +95,12 @@ def text_from_scores(score_item):
     return " ".join(str(word.get("text", "")) for word in words)
 
 
-def load_utt_order(keys_path, seq_data_dir):
-    utt_ids_path = seq_data_dir / "te_utt_ids.txt"
+def seq_prefix(seq_split):
+    return "tr" if seq_split in {"train", "tr"} else "te"
+
+
+def load_utt_order(keys_path, seq_data_dir, prefix):
+    utt_ids_path = seq_data_dir / f"{prefix}_utt_ids.txt"
     if utt_ids_path.exists():
         return [
             line.strip()
@@ -98,7 +108,7 @@ def load_utt_order(keys_path, seq_data_dir):
             if line.strip()
         ]
     if keys_path is None:
-        raise FileNotFoundError("Pass --keys-phn-csv when seq-data-dir has no te_utt_ids.txt")
+        raise FileNotFoundError(f"Pass --keys-phn-csv when seq-data-dir has no {prefix}_utt_ids.txt")
     utt_order = []
     previous = None
     for line in keys_path.read_text(encoding="utf-8").splitlines():
@@ -291,11 +301,12 @@ def main():
     device = torch.device(args.device)
     model = load_model(args.repo_src, args.checkpoint, device)
 
-    utt_ids = load_utt_order(args.keys_phn_csv, args.seq_data_dir)
+    prefix = seq_prefix(args.seq_split)
+    utt_ids = load_utt_order(args.keys_phn_csv, args.seq_data_dir, prefix)
     utt_to_index = {utt_id: index for index, utt_id in enumerate(utt_ids)}
-    feat_all = np.load(args.seq_data_dir / "te_feat.npy", mmap_mode="r")
-    phn_all = np.load(args.seq_data_dir / "te_label_phn.npy", mmap_mode="r")
-    word_all = np.load(args.seq_data_dir / "te_label_word.npy", mmap_mode="r")
+    feat_all = np.load(args.seq_data_dir / f"{prefix}_feat.npy", mmap_mode="r")
+    phn_all = np.load(args.seq_data_dir / f"{prefix}_label_phn.npy", mmap_mode="r")
+    word_all = np.load(args.seq_data_dir / f"{prefix}_label_word.npy", mmap_mode="r")
 
     aligner = get_match_index = None
     gt_word_time_by_utt = {}

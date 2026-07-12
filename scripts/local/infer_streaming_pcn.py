@@ -82,6 +82,11 @@ def load_model(config, metadata, checkpoint, device):
         depth=int(model_args.get('depth', 2)),
         gru_dim=int(model_args.get('gru_dim', 32)),
         main_context_tokens=int(model_args.get('main_context_tokens', 16)),
+        utt_pooling_head=str(config.get('utt_pooling_head', model_args.get('utt_pooling_head', 'gru'))),
+        fusion_mode=str(config.get('fusion_mode', model_args.get('fusion_mode', 'scalar_gate'))),
+        slot_prosody_dim=int(config.get('slot_prosody_dim', 0)),
+        stress_branch=str(config.get('stress_branch', model_args.get('stress_branch', 'none'))),
+        stress_grad_scale=float(config.get('stress_grad_scale', model_args.get('stress_grad_scale', 0.2))),
     )
     weights = torch.load(checkpoint, map_location=device)
     model.load_state_dict(weights)
@@ -154,6 +159,15 @@ def tensor_batch(example, metadata, config, device):
         'new_commit_mask': pad(example['new_commit_mask'].reshape(-1, 1), seq_len).reshape(1, seq_len),
         'visible_len': np.array([min(example['cn_post'].shape[0], seq_len)], dtype=np.int64),
     }
+    slot_prosody_dim = int(config.get('slot_prosody_dim', 0))
+    if slot_prosody_dim > 0:
+        if 'slot_prosody' in example:
+            slot_mean = np.asarray(config.get('slot_prosody_norm_mean', np.zeros((slot_prosody_dim,), dtype=np.float32)), dtype=np.float32)
+            slot_std = np.asarray(config.get('slot_prosody_norm_std', np.ones((slot_prosody_dim,), dtype=np.float32)), dtype=np.float32)
+            slot_prosody = (example['slot_prosody'] - slot_mean.reshape(1, -1)) / np.clip(slot_std.reshape(1, -1), 1e-6, None)
+            batch['slot_prosody'] = pad(slot_prosody, seq_len)[None]
+        else:
+            batch['slot_prosody'] = np.zeros((1, seq_len, slot_prosody_dim), dtype=np.float32)
     return {
         key: torch.tensor(value, dtype=torch.long if key in {'pcn_word_id', 'visible_len'} else torch.float32, device=device)
         for key, value in batch.items()

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${ROOT:-/DATA_2/guest/custom-gopt}"
-MULTIPA_ROOT="${MULTIPA_ROOT:-/DATA_2/guest/MultiPA_pic}"
+MULTIPA_ROOT="${MULTIPA_ROOT:-/DATA_2/MultiPA}"
 DATA_DIR="${DATA_DIR:-$ROOT/data/streaming_pcn_gopt_v2_stateful}"
 EXP_DIR="${EXP_DIR:-$ROOT/exp/streaming-pcn-gopt-v2-stateful-teacher}"
 CUSTOM_PY="${CUSTOM_PY:-$ROOT/.conda_env/bin/python}"
@@ -37,6 +37,21 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$HF_HOME" \
   "$XDG_CACHE_HOME" "$TORCH_HOME" "$NLTK_DATA" "$TEACHER_DIR"
+
+if [ "$(readlink -f "$MULTIPA_ROOT")" = "/DATA_2/guest/MultiPA_pic" ]; then
+  echo "/DATA_2/guest/MultiPA_pic is not the original MultiPA repository; use /DATA_2/MultiPA." >&2
+  exit 2
+fi
+for required_path in \
+  "$MULTIPA_ROOT/eval_multipa_prefix.py" \
+  "$MULTIPA_ROOT/fairseq_hubert/hubert_base_ls960.pt" \
+  "$MULTIPA_ROOT/fairseq_roberta" \
+  "$MULTIPA_ROOT/model_assessment"; do
+  if [ ! -e "$required_path" ]; then
+    echo "Missing required MultiPA asset: $required_path" >&2
+    exit 2
+  fi
+done
 
 IFS=',' read -r -a GPU_LIST <<< "$TEACHER_GPUS"
 if [ "${#GPU_LIST[@]}" -eq 0 ]; then

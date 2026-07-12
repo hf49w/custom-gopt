@@ -309,6 +309,10 @@ Run the same command for `val` and `test` JSONL files when available. `inject_mu
 
 MultiPA does not output completeness, so `teacher_utt_dim_mask[:, 1] = 0`; human labels still supervise completeness.
 
+### Optional PCN Extra Experiments
+
+Additional PCN v2 stateful experiments are documented in `docs/PCN_EXTRA_EXPERIMENTS.md`. They are all opt-in: the default model path remains `scalar_gate`, `gru` utterance pooling, no slot prosody, original soft-label supervision, and utterance dimension weights `1,1,1,1,1`.
+
 ### No-GT Streaming Inference
 
 `scripts/local/infer_streaming_pcn.py` runs the deployed path. Inputs are only WAV, Whisper, Charsiu, and the PCN checkpoint/config:

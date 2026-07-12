@@ -27,6 +27,14 @@ def load_jsonl(path):
     return rows
 
 
+def teacher_state_dim(rows):
+    for row in rows:
+        state = row.get('teacher_state_embedding')
+        if isinstance(state, list) and state:
+            return len(state)
+    return 0
+
+
 def utt_score(row):
     scores = row.get('scores') or {}
     # MultiPA does not expose completeness. Keep that dimension masked out.
@@ -142,6 +150,7 @@ def main():
     args = get_args()
     splits = [item.strip() for item in args.splits.split(',') if item.strip()]
     teacher_rows = load_jsonl(args.teacher_jsonl)
+    state_dim = teacher_state_dim(teacher_rows)
     teacher_by_key = {
         (str(row.get('utt_id')), int(row.get('chunk_id', -1))): row
         for row in teacher_rows
@@ -168,6 +177,15 @@ def main():
         teacher_word_score = np.zeros((count, seq_len, 3), dtype=np.float32)
         teacher_word_mask = np.zeros((count, seq_len), dtype=np.float32)
         teacher_word_dim_mask = np.zeros((count, seq_len, 3), dtype=np.float32)
+        cur_state_dim = state_dim
+        if cur_state_dim <= 0 and 'teacher_state_embedding' in arrays:
+            cur_state_dim = int(arrays['teacher_state_embedding'].shape[-1])
+        teacher_state_embedding = (
+            np.zeros((count, cur_state_dim), dtype=np.float32)
+            if cur_state_dim > 0
+            else None
+        )
+        teacher_state_mask = np.zeros((count,), dtype=np.float32)
 
         final_by_utt = {}
         for row in manifest:
@@ -200,6 +218,13 @@ def main():
             teacher_word_score[idx] = word_score
             teacher_word_mask[idx] = word_mask
             teacher_word_dim_mask[idx] = word_dim_mask
+            if teacher_state_embedding is not None:
+                state = teacher_row.get('teacher_state_embedding')
+                if isinstance(state, list) and len(state) == teacher_state_embedding.shape[-1]:
+                    state_array = np.asarray(state, dtype=np.float32)
+                    if np.isfinite(state_array).all():
+                        teacher_state_embedding[idx] = state_array
+                        teacher_state_mask[idx] = 1.0
 
         arrays['teacher_prefix_utt_score'] = teacher_prefix
         arrays['teacher_final_utt_score'] = teacher_final
@@ -208,6 +233,12 @@ def main():
         arrays['teacher_word_score'] = teacher_word_score
         arrays['teacher_word_mask'] = teacher_word_mask
         arrays['teacher_word_dim_mask'] = teacher_word_dim_mask
+        if teacher_state_embedding is not None:
+            arrays['teacher_state_embedding'] = teacher_state_embedding
+            arrays['teacher_state_mask'] = teacher_state_mask
+        else:
+            arrays.pop('teacher_state_embedding', None)
+            arrays.pop('teacher_state_mask', None)
         dst_path = output_dir / f'{split}_chunks.npz'
         if dst_path.exists() and output_dir == args.data_dir:
             shutil.copy2(dst_path, dst_path.with_suffix('.npz.bak'))
@@ -220,6 +251,8 @@ def main():
                     'teacher_rows_used': int(teacher_mask.sum()),
                     'teacher_word_slots': int(teacher_word_mask.sum()),
                     'teacher_word_dimensions': int(teacher_word_dim_mask.sum()),
+                    'teacher_state_rows': int(teacher_state_mask.sum()),
+                    'teacher_state_dim': int(teacher_state_embedding.shape[-1]) if teacher_state_embedding is not None else 0,
                     'output': str(dst_path),
                 },
                 ensure_ascii=False,

@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -13,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / 'src' / 'prep_data'))
 
 from models import PCNStreamingScorer
 from build_streaming_pcn_gopt_data import build_pcn_from_hypotheses
-from train_streaming_pcn import PCNUtteranceDataset, make_loader, reset_state_where_needed
+from train_streaming_pcn import PCNUtteranceDataset, effective_supervision_weight, make_loader, reset_state_where_needed
 
 
 def make_chunk(phone_dim=5, seq_len=4):
@@ -94,6 +95,118 @@ def test_state_reset():
     assert torch.all(out[:, 1] == 1), 'second utterance state should be preserved'
 
 
+def test_gru_visible_forward_shape():
+    phone_dim = 5
+    seq_len = 4
+    model = PCNStreamingScorer(
+        phone_dim=phone_dim,
+        seq_len=seq_len,
+        embed_dim=16,
+        gru_dim=12,
+        depth=1,
+        num_heads=1,
+        utt_pooling_head='gru_visible',
+    )
+    model.eval()
+    cn_post, cn_stats, acoustic_post, acoustic_stats, prosody, word_ids = make_chunk(phone_dim, seq_len)
+    out = model(
+        cn_post,
+        cn_stats,
+        acoustic_post,
+        acoustic_stats,
+        prosody,
+        visible_len=torch.tensor([seq_len]),
+        cumulative_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+        new_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+        word_ids=word_ids,
+    )
+    assert out['utt_scores'].shape == (1, 5), 'gru_visible should keep utterance score shape'
+
+
+def test_concat_vector_gate_forward_shape():
+    phone_dim = 5
+    seq_len = 4
+    model = PCNStreamingScorer(
+        phone_dim=phone_dim,
+        seq_len=seq_len,
+        embed_dim=16,
+        gru_dim=12,
+        depth=1,
+        num_heads=1,
+        fusion_mode='concat_vector_gate',
+    )
+    model.eval()
+    cn_post, cn_stats, acoustic_post, acoustic_stats, prosody, word_ids = make_chunk(phone_dim, seq_len)
+    out = model(
+        cn_post,
+        cn_stats,
+        acoustic_post,
+        acoustic_stats,
+        prosody,
+        visible_len=torch.tensor([seq_len]),
+        cumulative_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+        new_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+        word_ids=word_ids,
+    )
+    assert out['phone_score'].shape == (1, seq_len, 1), 'concat_vector_gate should keep phone score shape'
+
+
+def test_detached_stress_branch_forward_shape():
+    phone_dim = 5
+    seq_len = 4
+    model = PCNStreamingScorer(
+        phone_dim=phone_dim,
+        seq_len=seq_len,
+        embed_dim=16,
+        gru_dim=12,
+        depth=1,
+        num_heads=1,
+        stress_branch='detached',
+    )
+    model.eval()
+    cn_post, cn_stats, acoustic_post, acoustic_stats, prosody, word_ids = make_chunk(phone_dim, seq_len)
+    out = model(
+        cn_post,
+        cn_stats,
+        acoustic_post,
+        acoustic_stats,
+        prosody,
+        visible_len=torch.tensor([seq_len]),
+        cumulative_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+        new_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+        word_ids=word_ids,
+    )
+    assert out['word_scores'].shape == (1, seq_len, 3), 'detached stress branch should keep word score shape'
+
+
+def test_relaxed_supervision_weight():
+    cn_post = torch.zeros(1, 3, 5)
+    acoustic_post = torch.zeros(1, 3, 5)
+    cn_post[0, 0, 2] = 0.4
+    acoustic_post[0, 0, 2] = 0.5
+    chunk = {
+        'cn_post': cn_post,
+        'acoustic_post': acoustic_post,
+        'phone_target': torch.tensor([[[2.0, 3.0], [1.0, 4.0], [-1.0, -1.0]]]),
+        'soft_label_weight': torch.zeros(1, 3),
+        'cumulative_commit_mask': torch.tensor([[1.0, 1.0, 0.0]]),
+        'confidence_loss_mask': torch.zeros(1, 3),
+        'asr_correct_target': torch.zeros(1, 3),
+    }
+    valid_mask = torch.tensor([[1.0, 1.0, 0.0]])
+    base_args = {
+        'relaxed_min_gt_posterior': 0.05,
+        'relaxed_acoustic_scale': 0.3,
+        'relaxed_min_weight': 0.05,
+        'relaxed_max_weight': 0.5,
+    }
+    original = effective_supervision_weight(chunk, valid_mask, SimpleNamespace(soft_label_policy='original', **base_args))
+    relaxed = effective_supervision_weight(chunk, valid_mask, SimpleNamespace(soft_label_policy='relaxed', **base_args))
+    assert original[0, 0].item() == 0.0, 'original policy should preserve zero soft_label_weight'
+    assert relaxed[0, 0].item() > 0.0, 'relaxed policy should retain supported non-exact GT phone slots'
+    assert not torch.allclose(original, relaxed), 'original and relaxed policies should produce different weights here'
+
+
 def test_utterance_loader_preserves_chunk_order():
     tmp_dir = Path(tempfile.mkdtemp(prefix='toy_pcn_stateful_'))
     try:
@@ -150,6 +263,10 @@ def test_local_confidence_changes_pcn_posterior():
 def main():
     test_gru_new_commits_only()
     test_state_reset()
+    test_gru_visible_forward_shape()
+    test_concat_vector_gate_forward_shape()
+    test_detached_stress_branch_forward_shape()
+    test_relaxed_supervision_weight()
     test_utterance_loader_preserves_chunk_order()
     test_local_confidence_changes_pcn_posterior()
     print('stateful_pcn_tests_ok')

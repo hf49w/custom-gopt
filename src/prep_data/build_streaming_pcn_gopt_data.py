@@ -79,6 +79,7 @@ def get_args():
     parser.add_argument('--skip-finalize', action='store_true', help='Only write per-utterance progress files; do not build final NPZ/manifest outputs.')
     parser.add_argument('--num-shards', type=int, default=1, help='Number of utterance shards for this generation run.')
     parser.add_argument('--shard-index', type=int, default=0, help='Shard index to process, in [0, num-shards).')
+    parser.add_argument('--include-slot-prosody', action='store_true')
     parser.add_argument('--overwrite', action='store_true')
     return parser.parse_args()
 
@@ -1233,6 +1234,116 @@ def compute_prosody(audio, sample_rate, audio_end, word_count, phone_count):
     )
 
 
+def slot_prosody_feature_names():
+    return [
+        'slot_duration',
+        'slot_log_energy_mean',
+        'slot_log_energy_std',
+        'slot_log_energy_max',
+        'slot_f0_mean',
+        'slot_f0_std',
+        'slot_f0_max',
+        'slot_voiced_ratio',
+        'slot_position_in_word',
+        'word_phone_count',
+        'energy_relative_to_word_mean',
+        'duration_relative_to_word_mean',
+        'f0_relative_to_word_mean',
+        'is_vowel',
+        'lexical_stress_0',
+        'lexical_stress_1',
+        'lexical_stress_2',
+    ]
+
+
+def compute_slot_prosody(audio, sample_rate, slot_times, pcn_word_id, top_phone_ids, phn_dict):
+    feature_names = slot_prosody_feature_names()
+    slot_count = len(top_phone_ids)
+    out = np.zeros((slot_count, len(feature_names)), dtype=np.float32)
+    if slot_count <= 0:
+        return out
+    audio = np.asarray(audio, dtype=np.float32)
+    id_to_phone = {int(idx): phone for phone, idx in phn_dict.items()}
+    hop_length = max(int(0.01 * sample_rate), 1)
+    frame_length = max(int(0.025 * sample_rate), hop_length)
+    if audio.size:
+        rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+        log_energy = np.log(np.clip(rms, EPS, None))
+        frame_times = librosa.frames_to_time(np.arange(rms.shape[0]), sr=sample_rate, hop_length=hop_length)
+    else:
+        log_energy = np.zeros((0,), dtype=np.float32)
+        frame_times = np.zeros((0,), dtype=np.float32)
+    try:
+        f0, _, _ = librosa.pyin(
+            audio,
+            fmin=50,
+            fmax=500,
+            sr=sample_rate,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+    except Exception:
+        f0 = np.zeros_like(log_energy, dtype=np.float32) * np.nan
+    if f0 is None:
+        f0 = np.zeros_like(log_energy, dtype=np.float32) * np.nan
+    f0 = np.asarray(f0, dtype=np.float32)
+    common_frames = min(frame_times.shape[0], log_energy.shape[0], f0.shape[0])
+    frame_times = frame_times[:common_frames]
+    log_energy = log_energy[:common_frames]
+    f0 = f0[:common_frames]
+
+    durations = np.zeros((slot_count,), dtype=np.float32)
+    energy_means = np.zeros((slot_count,), dtype=np.float32)
+    f0_means = np.zeros((slot_count,), dtype=np.float32)
+    pcn_word_id = np.asarray(pcn_word_id, dtype=np.int32)
+    for slot_idx in range(slot_count):
+        if slot_idx < len(slot_times) and slot_times[slot_idx] is not None:
+            start, end = slot_times[slot_idx]
+            start = float(start)
+            end = float(max(end, start))
+        else:
+            start = 0.0
+            end = 0.0
+        durations[slot_idx] = max(end - start, 0.0)
+        frame_mask = (frame_times >= start) & (frame_times <= end) if frame_times.size else np.zeros((0,), dtype=bool)
+        energy_values = log_energy[frame_mask]
+        f0_values = f0[frame_mask]
+        f0_values = f0_values[np.isfinite(f0_values)]
+        if energy_values.size:
+            out[slot_idx, 1] = float(np.mean(energy_values))
+            out[slot_idx, 2] = float(np.std(energy_values))
+            out[slot_idx, 3] = float(np.max(energy_values))
+            energy_means[slot_idx] = out[slot_idx, 1]
+        if f0_values.size:
+            out[slot_idx, 4] = float(np.mean(f0_values))
+            out[slot_idx, 5] = float(np.std(f0_values))
+            out[slot_idx, 6] = float(np.max(f0_values))
+            out[slot_idx, 7] = float(f0_values.size / max(frame_mask.sum(), 1))
+            f0_means[slot_idx] = out[slot_idx, 4]
+        out[slot_idx, 0] = durations[slot_idx]
+        word_idx = int(pcn_word_id[slot_idx]) if slot_idx < pcn_word_id.shape[0] else -1
+        same_word = np.flatnonzero(pcn_word_id == word_idx) if word_idx >= 0 else np.asarray([slot_idx], dtype=np.int64)
+        if same_word.size:
+            position = np.flatnonzero(same_word == slot_idx)
+            out[slot_idx, 8] = float(position[0] / max(same_word.size - 1, 1)) if position.size else 0.0
+            out[slot_idx, 9] = float(same_word.size)
+        phone_idx = top_phone_ids[slot_idx] if slot_idx < len(top_phone_ids) else None
+        phone = id_to_phone.get(int(phone_idx), '') if phone_idx is not None else ''
+        out[slot_idx, 13] = 1.0 if phone[:1].upper() in {'A', 'E', 'I', 'O', 'U'} else 0.0
+
+    for slot_idx in range(slot_count):
+        word_idx = int(pcn_word_id[slot_idx]) if slot_idx < pcn_word_id.shape[0] else -1
+        same_word = np.flatnonzero(pcn_word_id == word_idx) if word_idx >= 0 else np.asarray([slot_idx], dtype=np.int64)
+        if same_word.size:
+            word_energy = float(np.mean(energy_means[same_word]))
+            word_duration = float(np.mean(durations[same_word]))
+            word_f0 = float(np.mean(f0_means[same_word]))
+            out[slot_idx, 10] = out[slot_idx, 1] - word_energy
+            out[slot_idx, 11] = durations[slot_idx] / max(word_duration, EPS)
+            out[slot_idx, 12] = out[slot_idx, 4] - word_f0
+    return out.astype(np.float32)
+
+
 def slope(values):
     values = np.asarray(values, dtype=np.float32)
     if values.size < 2:
@@ -1440,6 +1551,16 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
         top_word_count = len(hypotheses[0]['words']) if hypotheses else 0
         top_phone_count = sum(1 for phone_idx in pcn['top_phone_ids'] if phone_idx is not None)
         prosody = compute_prosody(audio_prefix, args.sample_rate, audio_end, top_word_count, top_phone_count)
+        slot_prosody = None
+        if args.include_slot_prosody:
+            slot_prosody = compute_slot_prosody(
+                audio_prefix,
+                args.sample_rate,
+                pcn.get('slot_times', []),
+                pcn_word_id,
+                pcn['top_phone_ids'],
+                phn_dict,
+            )
         cumulative_commit_mask, new_commit_mask, mapped_old_slot, commit_diagnostics, prev_commit_state = build_stateful_commit_masks(
             prev_commit_state,
             pcn,
@@ -1476,6 +1597,7 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
             'acoustic_post': acoustic_post.astype(np.float32),
             'acoustic_stats': acoustic_stats.astype(np.float32),
             'prosody': prosody.astype(np.float32),
+            **({'slot_prosody': slot_prosody.astype(np.float32)} if slot_prosody is not None else {}),
             'pcn_word_id': pcn_word_id.astype(np.int32),
             'cumulative_commit_mask': cumulative_commit_mask.astype(np.float32),
             'new_commit_mask': new_commit_mask.astype(np.float32),
@@ -1705,6 +1827,8 @@ def pad_2d(src, length, fill_value=0.0):
 
 
 def build_arrays(examples, seq_len, phone_dim, prosody_dim):
+    include_slot_prosody = any('slot_prosody' in example for example in examples)
+    slot_prosody_dim = len(slot_prosody_feature_names()) if include_slot_prosody else 0
     arrays = {
         'cn_post': [],
         'cn_stats': [],
@@ -1742,6 +1866,10 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         'cumulative_committed_word_count': [],
         'prefix_stability': [],
     }
+    if include_slot_prosody:
+        arrays['slot_prosody'] = []
+        arrays['slot_is_vowel'] = []
+        arrays['slot_voiced_ratio'] = []
     manifest = []
     for example in examples:
         visible_len = int(example['cn_post'].shape[0])
@@ -1750,6 +1878,19 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         arrays['acoustic_post'].append(pad_2d(example['acoustic_post'], seq_len))
         arrays['acoustic_stats'].append(pad_2d(example['acoustic_stats'], seq_len))
         arrays['prosody'].append(example['prosody'].reshape(prosody_dim))
+        if include_slot_prosody:
+            cur_slot_prosody = np.asarray(
+                example.get('slot_prosody', np.zeros((visible_len, slot_prosody_dim), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            arrays['slot_prosody'].append(
+                pad_2d(
+                    cur_slot_prosody,
+                    seq_len,
+                )
+            )
+            arrays['slot_is_vowel'].append(pad_2d(cur_slot_prosody[:, 13:14], seq_len).reshape(seq_len))
+            arrays['slot_voiced_ratio'].append(pad_2d(cur_slot_prosody[:, 7:8], seq_len).reshape(seq_len))
         arrays['pcn_word_id'].append(pad_2d(example['pcn_word_id'].reshape(-1, 1), seq_len, fill_value=-1).reshape(seq_len))
         arrays['phone_target'].append(pad_2d(example['phone_target'], seq_len, fill_value=-1.0))
         arrays['word_target'].append(pad_2d(example['word_target'], seq_len, fill_value=-1.0))
@@ -1829,9 +1970,10 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
             'word_token_ranges': [row.get('word_token_ranges', []) for row in example['hypotheses']],
             'word_logprobs': [row.get('word_logprobs', []) for row in example['hypotheses']],
             'word_confidences': [row.get('word_confidences', []) for row in example['hypotheses']],
+            'slot_times': example.get('slot_times', []),
         })
 
-    return {
+    out = {
         'cn_post': np.stack(arrays['cn_post']).astype(np.float32),
         'cn_stats': np.stack(arrays['cn_stats']).astype(np.float32),
         'acoustic_post': np.stack(arrays['acoustic_post']).astype(np.float32),
@@ -1869,47 +2011,58 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
         'prefix_stability': np.asarray(arrays['prefix_stability'], dtype=np.float32),
         'manifest': manifest,
     }
+    if include_slot_prosody:
+        out['slot_prosody'] = np.stack(arrays['slot_prosody']).astype(np.float32)
+        out['slot_is_vowel'] = np.stack(arrays['slot_is_vowel']).astype(np.float32)
+        out['slot_voiced_ratio'] = np.stack(arrays['slot_voiced_ratio']).astype(np.float32)
+    return out
 
 
 def save_split(split_name, arrays, output_dir):
-    np.savez_compressed(
-        output_dir / f'{split_name}_chunks.npz',
-        cn_post=arrays['cn_post'],
-        cn_stats=arrays['cn_stats'],
-        acoustic_post=arrays['acoustic_post'],
-        acoustic_stats=arrays['acoustic_stats'],
-        prosody=arrays['prosody'],
-        pcn_word_id=arrays['pcn_word_id'],
-        phone_target=arrays['phone_target'],
-        word_target=arrays['word_target'],
-        utt_target=arrays['utt_target'],
-        asr_correct_target=arrays['asr_correct_target'],
-        uncertainty_target=arrays['uncertainty_target'],
-        soft_label_weight=arrays['soft_label_weight'],
-        commit_mask=arrays['commit_mask'],
-        cumulative_commit_mask=arrays['cumulative_commit_mask'],
-        new_commit_mask=arrays['new_commit_mask'],
-        mapped_old_slot=arrays['mapped_old_slot'],
-        confidence_target=arrays['confidence_target'],
-        confidence_loss_mask=arrays['confidence_loss_mask'],
-        abstention_target=arrays['abstention_target'],
-        abstention_loss_mask=arrays['abstention_loss_mask'],
-        teacher_prefix_utt_score=arrays['teacher_prefix_utt_score'],
-        teacher_final_utt_score=arrays['teacher_final_utt_score'],
-        teacher_utt_mask=arrays['teacher_utt_mask'],
-        teacher_word_score=arrays['teacher_word_score'],
-        teacher_word_mask=arrays['teacher_word_mask'],
-        coverage_ratio=arrays['coverage_ratio'],
-        visible_len=arrays['visible_len'],
-        is_final=arrays['is_final'],
-        chunk_id=arrays['chunk_id'],
-        previous_chunk_id=arrays['previous_chunk_id'],
-        utterance_index=arrays['utterance_index'],
-        state_reset=arrays['state_reset'],
-        new_committed_word_count=arrays['new_committed_word_count'],
-        cumulative_committed_word_count=arrays['cumulative_committed_word_count'],
-        prefix_stability=arrays['prefix_stability'],
-    )
+    payload = {
+        'cn_post': arrays['cn_post'],
+        'cn_stats': arrays['cn_stats'],
+        'acoustic_post': arrays['acoustic_post'],
+        'acoustic_stats': arrays['acoustic_stats'],
+        'prosody': arrays['prosody'],
+        'pcn_word_id': arrays['pcn_word_id'],
+        'phone_target': arrays['phone_target'],
+        'word_target': arrays['word_target'],
+        'utt_target': arrays['utt_target'],
+        'asr_correct_target': arrays['asr_correct_target'],
+        'uncertainty_target': arrays['uncertainty_target'],
+        'soft_label_weight': arrays['soft_label_weight'],
+        'commit_mask': arrays['commit_mask'],
+        'cumulative_commit_mask': arrays['cumulative_commit_mask'],
+        'new_commit_mask': arrays['new_commit_mask'],
+        'mapped_old_slot': arrays['mapped_old_slot'],
+        'confidence_target': arrays['confidence_target'],
+        'confidence_loss_mask': arrays['confidence_loss_mask'],
+        'abstention_target': arrays['abstention_target'],
+        'abstention_loss_mask': arrays['abstention_loss_mask'],
+        'teacher_prefix_utt_score': arrays['teacher_prefix_utt_score'],
+        'teacher_final_utt_score': arrays['teacher_final_utt_score'],
+        'teacher_utt_mask': arrays['teacher_utt_mask'],
+        'teacher_word_score': arrays['teacher_word_score'],
+        'teacher_word_mask': arrays['teacher_word_mask'],
+        'coverage_ratio': arrays['coverage_ratio'],
+        'visible_len': arrays['visible_len'],
+        'is_final': arrays['is_final'],
+        'chunk_id': arrays['chunk_id'],
+        'previous_chunk_id': arrays['previous_chunk_id'],
+        'utterance_index': arrays['utterance_index'],
+        'state_reset': arrays['state_reset'],
+        'new_committed_word_count': arrays['new_committed_word_count'],
+        'cumulative_committed_word_count': arrays['cumulative_committed_word_count'],
+        'prefix_stability': arrays['prefix_stability'],
+    }
+    if 'slot_prosody' in arrays:
+        payload['slot_prosody'] = arrays['slot_prosody']
+    if 'slot_is_vowel' in arrays:
+        payload['slot_is_vowel'] = arrays['slot_is_vowel']
+    if 'slot_voiced_ratio' in arrays:
+        payload['slot_voiced_ratio'] = arrays['slot_voiced_ratio']
+    np.savez_compressed(output_dir / f'{split_name}_chunks.npz', **payload)
     with open(output_dir / f'{split_name}_manifest.jsonl', 'w', encoding='utf-8') as handle:
         for row in arrays['manifest']:
             handle.write(json.dumps(safe_json(row), ensure_ascii=False) + '\n')
@@ -2057,6 +2210,7 @@ def main():
         'phone_rate',
         'articulation_rate',
     ]
+    slot_prosody_names = slot_prosody_feature_names() if args.include_slot_prosody else []
     for split_name in target_splits:
         arrays = build_arrays(split_examples[split_name], seq_len, phone_dim, len(prosody_names))
         save_split(split_name, arrays, output_dir)
@@ -2105,6 +2259,14 @@ def main():
         'cn_stats': ['epsilon_probability', 'entropy', 'top1_probability', 'top1_top2_margin', 'prefix_stability'],
         'acoustic_stats': ['entropy', 'top1_top2_margin', 'duration', 'pcn_charsiu_js_divergence'],
         'prosody': prosody_names,
+        **(
+            {
+                'slot_prosody': slot_prosody_names,
+                'slot_prosody_note': 'Lexical stress one-hot features are zero fallback because reliable lexical stress is not available in this builder.',
+            }
+            if args.include_slot_prosody
+            else {}
+        ),
         'targets': [
             'phone_target',
             'word_target',
@@ -2135,7 +2297,7 @@ def main():
             'teacher_word_score',
             'teacher_word_mask',
             'coverage_ratio',
-        ],
+        ] + (['slot_prosody', 'slot_is_vowel', 'slot_voiced_ratio'] if args.include_slot_prosody else []),
         'supervision_policy': {
             'gt_usage': 'GT text/phones/scores are used only for offline training supervision, not as inference input.',
             'exact_match': 'soft_label_weight=1 and asr_correct_target=1 when the committed PCN top phone matches GT and its GT word appears in N-best.',

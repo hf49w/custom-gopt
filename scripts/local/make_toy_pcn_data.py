@@ -20,6 +20,8 @@ def get_args():
     parser.add_argument('--seq-len', type=int, default=12)
     parser.add_argument('--phone-dim', type=int, default=43)
     parser.add_argument('--prosody-dim', type=int, default=14)
+    parser.add_argument('--include-slot-prosody', action='store_true')
+    parser.add_argument('--slot-prosody-dim', type=int, default=17)
     parser.add_argument('--seed', type=int, default=1337)
     return parser.parse_args()
 
@@ -31,7 +33,7 @@ def softmax_rows(rng, shape):
     return exp_arr / np.clip(exp_arr.sum(axis=-1, keepdims=True), 1e-8, None)
 
 
-def build_split(rng, utt_count, chunks_per_utt, seq_len, phone_dim, prosody_dim):
+def build_split(rng, utt_count, chunks_per_utt, seq_len, phone_dim, prosody_dim, slot_prosody_dim=0):
     count = utt_count * chunks_per_utt
     cn_post = softmax_rows(rng, (count, seq_len, phone_dim))
     acoustic_post = softmax_rows(rng, (count, seq_len, phone_dim))
@@ -59,6 +61,7 @@ def build_split(rng, utt_count, chunks_per_utt, seq_len, phone_dim, prosody_dim)
         axis=-1,
     ).astype(np.float32)
     prosody = rng.normal(size=(count, prosody_dim)).astype(np.float32)
+    slot_prosody = rng.normal(size=(count, seq_len, slot_prosody_dim)).astype(np.float32) if slot_prosody_dim > 0 else None
     visible_len = np.full((count,), seq_len, dtype=np.int32)
     pcn_word_id = np.tile(np.arange(seq_len, dtype=np.int32), (count, 1)) // 3
     phone_target = np.zeros((count, seq_len, 2), dtype=np.float32) - 1.0
@@ -118,7 +121,7 @@ def build_split(rng, utt_count, chunks_per_utt, seq_len, phone_dim, prosody_dim)
     teacher_final = np.clip(utt_target + rng.normal(scale=0.2, size=(count, 5)), 1.0, 5.0).astype(np.float32)
     teacher_word = np.clip(word_target[:, :, 0:3] + rng.normal(scale=0.2, size=(count, seq_len, 3)), 1.0, 5.0).astype(np.float32)
     teacher_word_mask = cumulative_commit_mask.copy()
-    return {
+    arrays = {
         'cn_post': cn_post.astype(np.float32),
         'cn_stats': cn_stats,
         'acoustic_post': acoustic_post.astype(np.float32),
@@ -156,6 +159,11 @@ def build_split(rng, utt_count, chunks_per_utt, seq_len, phone_dim, prosody_dim)
         'cumulative_committed_word_count': cumulative_committed_word_count,
         'prefix_stability': prefix_stability,
     }
+    if slot_prosody is not None:
+        arrays['slot_prosody'] = slot_prosody
+        arrays['slot_is_vowel'] = (slot_prosody[:, :, 13] > 0).astype(np.float32) if slot_prosody_dim > 13 else np.zeros((count, seq_len), dtype=np.float32)
+        arrays['slot_voiced_ratio'] = np.clip(slot_prosody[:, :, 7], 0.0, 1.0).astype(np.float32) if slot_prosody_dim > 7 else np.zeros((count, seq_len), dtype=np.float32)
+    return arrays
 
 
 def save_split(output_dir, split, arrays):
@@ -179,6 +187,7 @@ def save_split(output_dir, split, arrays):
                     'dropped_or_revised_slots': [],
                 },
                 'word_timestamps': [],
+                'slot_times': [],
                 'timestamp_source': ['toy'],
             }
             handle.write(json.dumps(row, ensure_ascii=False) + '\n')
@@ -195,7 +204,15 @@ def main():
         save_split(
             args.output_dir,
             split,
-            build_split(rng, count, args.chunks_per_utt, args.seq_len, args.phone_dim, args.prosody_dim),
+            build_split(
+                rng,
+                count,
+                args.chunks_per_utt,
+                args.seq_len,
+                args.phone_dim,
+                args.prosody_dim,
+                args.slot_prosody_dim if args.include_slot_prosody else 0,
+            ),
         )
     metadata = {
         'schema': SCHEMA,
@@ -204,6 +221,7 @@ def main():
         'phone_dim': int(args.phone_dim),
         'epsilon_index': int(args.phone_dim - 1),
         'prosody': [f'p{i}' for i in range(args.prosody_dim)],
+        **({'slot_prosody': [f'slot_p{i}' for i in range(args.slot_prosody_dim)]} if args.include_slot_prosody else {}),
         'phn_dict': {f'P{i}': i for i in range(args.phone_dim - 1)},
         'synthetic': True,
         'targets': [
@@ -214,7 +232,7 @@ def main():
             'confidence_loss_mask',
             'abstention_target',
             'abstention_loss_mask',
-        ],
+        ] + (['slot_prosody', 'slot_is_vowel', 'slot_voiced_ratio'] if args.include_slot_prosody else []),
     }
     (args.output_dir / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
 
