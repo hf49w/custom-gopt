@@ -32,7 +32,7 @@ if not config_path.exists():
 config = json.loads(config_path.read_text(encoding="utf-8"))
 data_dir = Path(config["data_dir"])
 if not data_dir.is_absolute():
-    data_dir = repo / data_dir
+    data_dir = repo / data_di
 print(data_dir)
 PY
 }
@@ -261,7 +261,7 @@ inject_oracle_data() {
 
 prepare() {
   mkdir -p "$EXP_ROOT"
-  local data_dir
+  local data_di
   data_dir="$(pcn_data_dir)"
   if [[ ! -s "$ORACLE_JSONL" || "$FORCE" == "1" ]]; then
     local gpu

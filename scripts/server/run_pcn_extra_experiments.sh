@@ -99,7 +99,7 @@ print_oracle_injection_hint() {
 
 command_for_exp() {
   local exp_name="$1"
-  local data_dir
+  local data_di
   data_dir="$(data_dir_for_exp "$exp_name")"
   mapfile -t extra_args < <(args_for_exp "$exp_name")
   join_cmd env CUDA_VISIBLE_DEVICES="$GPU" python src/train_streaming_pcn.py \
