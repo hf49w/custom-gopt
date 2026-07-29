@@ -96,8 +96,12 @@ def get_args():
     parser.add_argument('--relaxed-acoustic-scale', type=float, default=0.3)
     parser.add_argument('--relaxed-min-weight', type=float, default=0.05)
     parser.add_argument('--relaxed-max-weight', type=float, default=0.5)
-    parser.add_argument('--utt-pooling-head', choices=['gru', 'gru_visible'], default='gru')
-    parser.add_argument('--fusion-mode', choices=['scalar_gate', 'concat_vector_gate'], default='scalar_gate')
+    parser.add_argument('--utt-pooling-head', choices=['gru', 'gru_visible', 'visible_committed'], default='gru')
+    parser.add_argument('--fusion-mode', choices=['scalar_gate', 'concat_vector_gate', 'fixed_average'], default='scalar_gate')
+    parser.add_argument('--pcn-input-mode', choices=['posterior', 'top1_onehot'], default='posterior')
+    parser.add_argument('--disable-acoustic', action='store_true')
+    parser.add_argument('--disable-prosody', action='store_true')
+    parser.add_argument('--disable-uncertainty-stats', action='store_true')
     parser.add_argument('--rank-margin', type=float, default=0.02)
     parser.add_argument('--stress-rank-margin', type=float, default=0.02)
     parser.add_argument('--stress-rank-max-items', type=int, default=512)
@@ -444,6 +448,15 @@ def slice_chunk(batch, chunk_idx):
     return {key: value[:, chunk_idx] for key, value in batch.items() if key not in skip}
 
 
+def apply_input_ablation(chunk, args):
+    if args.pcn_input_mode == 'top1_onehot':
+        cn_post = chunk['cn_post']
+        top_idx = cn_post.argmax(dim=-1, keepdim=True)
+        chunk = dict(chunk)
+        chunk['cn_post'] = torch.zeros_like(cn_post).scatter_(-1, top_idx, 1.0)
+    return chunk
+
+
 def reset_state_where_needed(state, state_reset):
     if state is None:
         return None
@@ -524,7 +537,7 @@ def compute_sequential_losses(model, batch, args):
         cur_valid = batch['chunk_valid_mask'][:, chunk_idx]
         if cur_valid.sum().item() <= 0:
             continue
-        chunk = slice_chunk(batch, chunk_idx)
+        chunk = apply_input_ablation(slice_chunk(batch, chunk_idx), args)
         state = reset_state_where_needed(state, chunk['state_reset'])
         out = model(
             cn_post=chunk['cn_post'],
@@ -856,7 +869,7 @@ def evaluate(model, loader, args, device):
             cur_valid = batch['chunk_valid_mask'][:, chunk_idx]
             if cur_valid.sum().item() <= 0:
                 continue
-            chunk = slice_chunk(batch, chunk_idx)
+            chunk = apply_input_ablation(slice_chunk(batch, chunk_idx), args)
             state = reset_state_where_needed(state, chunk['state_reset'])
             out = model(
                 cn_post=chunk['cn_post'],
@@ -1101,6 +1114,9 @@ def main():
         slot_prosody_dim=slot_prosody_dim,
         stress_branch=args.stress_branch,
         stress_grad_scale=args.stress_grad_scale,
+        use_acoustic=not args.disable_acoustic,
+        use_prosody=not args.disable_prosody,
+        use_uncertainty_stats=not args.disable_uncertainty_stats,
     )
     config = {
         'data_dir': str(data_dir),
@@ -1117,6 +1133,10 @@ def main():
         'slot_prosody_norm_std': slot_prosody_std.tolist() if slot_prosody_std is not None else [],
         'utt_pooling_head': args.utt_pooling_head,
         'fusion_mode': args.fusion_mode,
+        'pcn_input_mode': args.pcn_input_mode,
+        'use_acoustic': not args.disable_acoustic,
+        'use_prosody': not args.disable_prosody,
+        'use_uncertainty_stats': not args.disable_uncertainty_stats,
         'stress_branch': args.stress_branch,
         'stress_grad_scale': args.stress_grad_scale,
         'uses_state_projection': bool(has_teacher_state and args.loss_w_state_projection > 0),

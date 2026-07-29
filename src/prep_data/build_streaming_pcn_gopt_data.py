@@ -1,11 +1,13 @@
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
 import pickle
 import re
 import shutil
+import wave
 from collections import Counter
 from pathlib import Path
 
@@ -14,10 +16,18 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+try:
+    import soundfile as sf
+except Exception:
+    sf = None
 
 from build_charsiu_seq_data import (
     EPS,
+    audio_logits,
     build_model_phone_map,
+    build_reference_records,
+    build_reference_word_records,
+    build_silence_keep_mask,
     load_official_charsiu_aligner,
     monotonic_align,
     normalize_phone,
@@ -80,6 +90,18 @@ def get_args():
     parser.add_argument('--num-shards', type=int, default=1, help='Number of utterance shards for this generation run.')
     parser.add_argument('--shard-index', type=int, default=0, help='Shard index to process, in [0, num-shards).')
     parser.add_argument('--include-slot-prosody', action='store_true')
+    parser.add_argument(
+        '--charsiu-mode',
+        choices=['full_wav_precomputed', 'prefix_recompute'],
+        default='full_wav_precomputed',
+        help='full_wav_precomputed preserves legacy data; prefix_recompute runs Charsiu on audio[:audio_end_t] for each chunk.',
+    )
+    parser.add_argument(
+        '--prefix-charsiu-cache-dir',
+        type=str,
+        default=None,
+        help='Cache directory for prefix_recompute Charsiu posteriors. Defaults to output-dir/prefix_charsiu_cache.',
+    )
     parser.add_argument('--overwrite', action='store_true')
     return parser.parse_args()
 
@@ -194,6 +216,243 @@ def safe_json(value):
     if isinstance(value, (np.floating, np.integer)):
         return value.item()
     return value
+
+
+def softmax_np_matrix(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return arr.astype(np.float32)
+    arr = arr - np.max(arr, axis=-1, keepdims=True)
+    exp_arr = np.exp(arr)
+    return (exp_arr / np.clip(np.sum(exp_arr, axis=-1, keepdims=True), EPS, None)).astype(np.float32)
+
+
+def audio_array_logits(audio, processor, model, sample_rate, device):
+    audio = np.asarray(audio, dtype=np.float32)
+    if hasattr(processor, 'audio_preprocess'):
+        inputs = processor.audio_preprocess(audio, sr=sample_rate)
+        inputs = torch.tensor(inputs, dtype=torch.float32).unsqueeze(0).to(device)
+        model_inputs = {'input_values': inputs}
+    else:
+        model_inputs = processor(audio, sampling_rate=sample_rate, return_tensors='pt')
+        model_inputs = {key: value.to(device) for key, value in model_inputs.items()}
+    with torch.no_grad():
+        logits = model(**model_inputs).logits[0].detach().cpu().numpy()
+    return softmax_np_matrix(logits), float(len(audio) / sample_rate)
+
+
+def stable_json_hash(payload):
+    text = json.dumps(safe_json(payload), ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def prefix_charsiu_cache_info(args, utt_id, audio_end):
+    cache_dir = Path(args.prefix_charsiu_cache_dir) if args.prefix_charsiu_cache_dir else Path(args.output_dir) / 'prefix_charsiu_cache'
+    payload = {
+        'utt_id': str(utt_id),
+        'audio_end': round(float(audio_end), 4),
+        'aligner_model': str(args.aligner_model),
+        'charsiu_lang': str(args.charsiu_lang),
+        'sample_rate': int(args.sample_rate),
+        'min_sil_frames': int(args.min_sil_frames),
+        'right_context_sec': float(args.right_context_sec),
+        'mode': 'prefix_recompute',
+    }
+    digest = stable_json_hash(payload)
+    safe_utt = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(utt_id))[:80]
+    millis = int(round(float(audio_end) * 1000.0))
+    path = cache_dir / safe_utt[:2] / f'{safe_utt}.{millis:09d}.{digest[:16]}.npz'
+    return path, payload, digest
+
+
+def load_audio_prefix(audio_path, audio_end, sample_rate):
+    duration = max(float(audio_end), 1e-4)
+    if sf is not None:
+        with sf.SoundFile(str(audio_path), 'r') as handle:
+            source_sr = int(handle.samplerate)
+            max_source_samples = int(math.ceil(duration * source_sr)) + 1
+            audio = handle.read(frames=max_source_samples, dtype='float32', always_2d=False)
+            if handle.tell() > max_source_samples:
+                raise AssertionError(
+                    f'prefix audio read exceeded audio_end: source_samples={handle.tell()} '
+                    f'max_allowed={max_source_samples} audio_end={audio_end}'
+                )
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        if source_sr != sample_rate:
+            audio = librosa.resample(audio, orig_sr=source_sr, target_sr=sample_rate)
+    else:
+        audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True, duration=duration)
+    max_resampled_samples = int(math.ceil(duration * sample_rate)) + 2
+    if audio.shape[0] > max_resampled_samples:
+        raise AssertionError(
+            f'prefix audio read exceeded audio_end: samples={audio.shape[0]} max_allowed={max_resampled_samples} audio_end={audio_end}'
+        )
+    return audio.astype(np.float32)
+
+
+def get_audio_duration(audio_path, sample_rate):
+    if sf is not None:
+        info = sf.info(str(audio_path))
+        return float(info.frames) / float(info.samplerate)
+    try:
+        with wave.open(str(audio_path), 'rb') as handle:
+            return float(handle.getnframes()) / float(handle.getframerate())
+    except Exception:
+        pass
+    try:
+        return float(librosa.get_duration(path=str(audio_path)))
+    except TypeError:
+        return float(librosa.get_duration(filename=str(audio_path)))
+
+
+def build_causal_gold_item(utt_id, audio_path, scores, phn_dict, phone_to_frame_id, sample_rate):
+    if utt_id not in scores:
+        return {'utt_id': utt_id, 'skip_reason': 'missing_scores'}
+    if not Path(audio_path).exists():
+        return {'utt_id': utt_id, 'skip_reason': 'missing_audio', 'audio_path': str(audio_path)}
+    try:
+        gold_words = build_reference_word_records(scores[utt_id])
+        ref_records = build_reference_records(scores[utt_id])
+    except Exception as exc:
+        return {'utt_id': utt_id, 'skip_reason': f'reference_parse_failed:{exc}'}
+    if not gold_words or not ref_records:
+        return {'utt_id': utt_id, 'skip_reason': 'empty_reference_text'}
+    for record in ref_records:
+        phone = record['phone']
+        if phone not in phn_dict or phone not in phone_to_frame_id:
+            return {'utt_id': utt_id, 'skip_reason': f'phone_not_in_model_vocab:{phone}'}
+
+    audio_duration = get_audio_duration(audio_path, sample_rate)
+    phone_count = max(len(ref_records), 1)
+    step = float(audio_duration) / float(phone_count)
+    gold_phone_segments = []
+    word_start_times = {}
+    word_end_times = {}
+    for idx, record in enumerate(ref_records):
+        start_time = float(idx * step)
+        end_time = float(audio_duration if idx == len(ref_records) - 1 else (idx + 1) * step)
+        word_id = int(record['word_id'])
+        word_start_times[word_id] = min(word_start_times.get(word_id, start_time), start_time)
+        word_end_times[word_id] = max(word_end_times.get(word_id, end_time), end_time)
+        gold_phone_segments.append({
+            'phone': record['phone'],
+            'phone_id': int(phn_dict[record['phone']]),
+            'phone_score': float(record['phone_score']),
+            'word_id': word_id,
+            'word_accuracy': float(record['word_accuracy']),
+            'word_stress': float(record['word_stress']),
+            'word_total': float(record['word_total']),
+            'start_time': start_time,
+            'end_time': end_time,
+            'timing_source': 'uniform_reference_fallback_no_full_wav_charsiu',
+        })
+    return {
+        'utt_id': utt_id,
+        'audio_path': str(audio_path),
+        'audio_duration': float(audio_duration),
+        'frame_step': 0.02,
+        'probs': np.zeros((0, len(phn_dict) + 1), dtype=np.float32),
+        'keep_mask': np.zeros((0,), dtype=bool),
+        'word_start_times': word_start_times,
+        'word_end_times': word_end_times,
+        'gold_words': gold_words,
+        'gold_phone_segments': gold_phone_segments,
+        'utt_scores': {
+            'accuracy': float(scores[utt_id]['accuracy']),
+            'completeness': float(scores[utt_id]['completeness']),
+            'fluency': float(scores[utt_id]['fluency']),
+            'prosodic': float(scores[utt_id]['prosodic']),
+            'total': float(scores[utt_id]['total']),
+        },
+        'charsiu_mode': 'prefix_recompute',
+        'charsiu_target_timing_source': 'uniform_reference_fallback_no_full_wav_charsiu',
+    }
+
+
+def recompute_prefix_charsiu_item(item, audio_prefix, audio_end, charsiu, args):
+    cache_path, cache_payload, cache_hash = prefix_charsiu_cache_info(args, item['utt_id'], audio_end)
+    max_allowed = int(math.ceil(float(audio_end) * int(args.sample_rate))) + 1
+    if int(len(audio_prefix)) > max_allowed:
+        raise AssertionError(
+            f'prefix_recompute received future audio: utt_id={item["utt_id"]} samples={len(audio_prefix)} max_allowed={max_allowed}'
+        )
+    metadata = dict(cache_payload)
+    metadata.update({
+        'config_hash': cache_hash,
+        'source_num_samples': int(len(audio_prefix)),
+        'max_allowed_samples': int(max_allowed),
+    })
+    cache_ok = False
+    if cache_path.exists():
+        try:
+            with np.load(cache_path, allow_pickle=False) as archive:
+                probs = archive['probs'].astype(np.float32)
+                keep_mask = archive['keep_mask'].astype(bool)
+                duration = float(archive['duration'][0])
+                cached_meta = json.loads(str(archive['metadata'][0]))
+            if int(cached_meta.get('source_num_samples', 0)) > int(cached_meta.get('max_allowed_samples', max_allowed)):
+                raise AssertionError(f'cached prefix Charsiu item violates audio_end assertion: {cache_path}')
+            cache_ok = True
+        except AssertionError:
+            raise
+        except Exception:
+            cache_ok = False
+    if not cache_ok:
+        probs, duration = audio_array_logits(
+            audio_prefix,
+            charsiu.charsiu_processor,
+            charsiu.aligner,
+            args.sample_rate,
+            args.device,
+        )
+        keep_mask = build_silence_keep_mask(charsiu, probs).astype(bool)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_cache_path = cache_path.with_suffix(cache_path.suffix + '.tmp')
+        with open(tmp_cache_path, 'wb') as handle:
+            np.savez_compressed(
+                handle,
+                probs=probs.astype(np.float32),
+                keep_mask=keep_mask.astype(np.int8),
+                duration=np.asarray([duration], dtype=np.float32),
+                metadata=np.asarray([json.dumps(safe_json(metadata), ensure_ascii=False)]),
+            )
+        os.replace(tmp_cache_path, cache_path)
+    chunk_item = dict(item)
+    chunk_item.update({
+        'probs': probs,
+        'keep_mask': keep_mask,
+        'frame_step': float(duration / max(probs.shape[0], 1)),
+        'charsiu_mode': 'prefix_recompute',
+        'charsiu_prefix_cache': str(cache_path),
+        'charsiu_prefix_audio_end': float(audio_end),
+        'charsiu_prefix_duration': float(duration),
+        'charsiu_prefix_config_hash': cache_hash,
+    })
+    return chunk_item
+
+
+def prepare_aligned_item(utt_id, audio_path, scores, charsiu, phone_to_frame_id, phn_dict, args):
+    if args.charsiu_mode == 'prefix_recompute':
+        return build_causal_gold_item(
+            utt_id=utt_id,
+            audio_path=audio_path,
+            scores=scores,
+            phn_dict=phn_dict,
+            phone_to_frame_id=phone_to_frame_id,
+            sample_rate=args.sample_rate,
+        )
+    return align_gold_utterance(
+        utt_id=utt_id,
+        audio_path=audio_path,
+        scores=scores,
+        charsiu=charsiu,
+        sample_rate=args.sample_rate,
+        device=args.device,
+        phone_to_frame_id=phone_to_frame_id,
+        phn_dict=phn_dict,
+    )
 
 
 def non_overlapping_occurrences(tokens, pattern):
@@ -1494,7 +1753,9 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
     examples = []
     skipped_chunks = []
     utt_id = item['utt_id']
-    audio, _ = librosa.load(item['audio_path'], sr=args.sample_rate, mono=True)
+    audio = None
+    if args.charsiu_mode == 'full_wav_precomputed':
+        audio, _ = librosa.load(item['audio_path'], sr=args.sample_rate, mono=True)
     final_time = max(item['word_end_times'].values()) if item['word_end_times'] else item['audio_duration']
     prev_top_phone_ids = []
     prev_commit_state = None
@@ -1503,7 +1764,14 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
     for chunk_id, commit_time in enumerate(commit_schedule(final_time, args.chunk_sec)):
         is_final = abs(commit_time - final_time) < 1e-5
         audio_end = final_time if is_final else min(final_time, commit_time + args.right_context_sec)
-        audio_prefix = audio[: int(max(audio_end, 1e-4) * args.sample_rate)]
+        if args.charsiu_mode == 'prefix_recompute':
+            audio_prefix = load_audio_prefix(item['audio_path'], audio_end, args.sample_rate)
+            chunk_item = recompute_prefix_charsiu_item(item, audio_prefix, audio_end, asr_generator.charsiu, args) if hasattr(asr_generator, 'charsiu') else None
+        else:
+            audio_prefix = audio[: int(max(audio_end, 1e-4) * args.sample_rate)]
+            chunk_item = item
+        if chunk_item is None:
+            raise RuntimeError('prefix_recompute requires asr_generator.charsiu to be set for per-prefix Charsiu logits.')
         raw_hypotheses = asr_generator.generate(audio_prefix, args.sample_rate, audio_end)
         hypotheses, filtered_hypotheses = filter_looping_hypotheses(
             raw_hypotheses,
@@ -1521,7 +1789,7 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
             continue
         hypotheses = [
             align_hypothesis_with_charsiu(
-                item=item,
+                item=chunk_item,
                 row=dict(row),
                 phone_mapper=phone_mapper,
                 phn_dict=phn_dict,
@@ -1541,7 +1809,7 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
         )
         prev_top_phone_ids = list(pcn['top_phone_ids'])
         acoustic_post, acoustic_stats, visible_frame_count = build_acoustic_evidence(
-            item,
+            chunk_item,
             pcn['cn_post'],
             pcn['top_phone_ids'],
             phone_to_frame_id,
@@ -1627,6 +1895,9 @@ def build_examples_for_utterance(item, asr_generator, phone_mapper, phn_dict, ph
             'visible_frame_count': int(visible_frame_count),
             'top_phone_count': int(top_phone_count),
             'coverage_ratio': float(audio_end / max(final_time, EPS)),
+            'charsiu_mode': args.charsiu_mode,
+            'charsiu_prefix_cache': chunk_item.get('charsiu_prefix_cache', ''),
+            'charsiu_target_timing_source': item.get('charsiu_target_timing_source', 'full_wav_charsiu_alignment'),
         })
         previous_chunk_id = int(chunk_id)
     return examples, skipped_chunks
@@ -1637,15 +1908,14 @@ def build_split(split_name, split_items, scores, charsiu, asr_generator, phone_m
     skipped = []
     skipped_chunks = []
     for utterance_index, (utt_id, audio_path) in enumerate(tqdm(split_items, desc=f'{split_name}-pcn')):
-        aligned = align_gold_utterance(
+        aligned = prepare_aligned_item(
             utt_id=utt_id,
             audio_path=audio_path,
             scores=scores,
             charsiu=charsiu,
-            sample_rate=args.sample_rate,
-            device=args.device,
             phone_to_frame_id=phone_to_frame_id,
             phn_dict=phn_dict,
+            args=args,
         )
         if 'skip_reason' in aligned:
             skipped.append(aligned)
@@ -1697,15 +1967,14 @@ def build_split_incremental(
             except Exception:
                 pass
 
-        aligned = align_gold_utterance(
+        aligned = prepare_aligned_item(
             utt_id=utt_id,
             audio_path=audio_path,
             scores=scores,
             charsiu=charsiu,
-            sample_rate=args.sample_rate,
-            device=args.device,
             phone_to_frame_id=phone_to_frame_id,
             phn_dict=phn_dict,
+            args=args,
         )
         if 'skip_reason' in aligned:
             record = make_progress_record(
@@ -1971,6 +2240,9 @@ def build_arrays(examples, seq_len, phone_dim, prosody_dim):
             'word_logprobs': [row.get('word_logprobs', []) for row in example['hypotheses']],
             'word_confidences': [row.get('word_confidences', []) for row in example['hypotheses']],
             'slot_times': example.get('slot_times', []),
+            'charsiu_mode': example.get('charsiu_mode', 'full_wav_precomputed'),
+            'charsiu_prefix_cache': example.get('charsiu_prefix_cache', ''),
+            'charsiu_target_timing_source': example.get('charsiu_target_timing_source', 'full_wav_charsiu_alignment'),
         })
 
     out = {
@@ -2121,6 +2393,7 @@ def main():
             max_new_tokens=args.asr_max_new_tokens,
             no_repeat_ngram_size=args.asr_no_repeat_ngram_size,
         )
+        asr_generator.charsiu = charsiu
 
         for split_name in target_splits:
             progress_generation_summary[split_name] = build_split_incremental(
@@ -2234,6 +2507,16 @@ def main():
         'num_shards': int(args.num_shards),
         'shard_index': int(args.shard_index),
         'aligner_model': args.aligner_model,
+        'charsiu_mode': args.charsiu_mode,
+        'prefix_charsiu_cache_dir': str(
+            Path(args.prefix_charsiu_cache_dir) if args.prefix_charsiu_cache_dir else output_dir / 'prefix_charsiu_cache'
+        ),
+        'prefix_recompute_causality': {
+            'enabled': bool(args.charsiu_mode == 'prefix_recompute'),
+            'assertion': 'Each prefix Charsiu cache is computed from audio loaded with duration <= audio_end_t; cache metadata stores source_num_samples and max_allowed_samples.',
+            'right_context_sec': float(args.right_context_sec),
+            'full_wav_precomputed_compatibility': 'Default mode preserves legacy results and may expose Charsiu future context because posteriors are computed on the complete WAV before frame truncation.',
+        },
         'asr_model': args.asr_model,
         'nbest': int(args.nbest),
         'beam_size': int(args.beam_size),

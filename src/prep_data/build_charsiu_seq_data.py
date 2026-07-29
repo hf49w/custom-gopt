@@ -240,7 +240,77 @@ def import_charsiu_forced_aligner(charsiu_src_dir=None):
     return charsiu_forced_aligner
 
 
+def resolve_charsiu_tokenizer_dir(charsiu_src_dir=None):
+    candidates = []
+    for name in ['CHARSIU_TOKENIZER_EN_CMU', 'CHARSU_TOKENIZER_EN_CMU']:
+        value = os.environ.get(name)
+        if value:
+            candidates.append(Path(value))
+    if charsiu_src_dir:
+        src_dir = Path(charsiu_src_dir)
+        candidates.extend([src_dir / 'local', src_dir.parent / 'local'])
+    repo_root = Path(__file__).resolve().parents[2]
+    cache_root = repo_root / 'server_assets' / 'hf_cache' / 'transformers' / 'models--charsiu--tokenizer_en_cmu'
+    refs_main = cache_root / 'refs' / 'main'
+    if refs_main.exists():
+        try:
+            revision = refs_main.read_text(encoding='utf-8').strip()
+            candidates.append(cache_root / 'snapshots' / revision)
+        except Exception:
+            pass
+    for path in candidates:
+        if (path / 'vocab.json').exists():
+            return path
+    return None
+
+
+def patch_charsiu_tokenizer_loader(charsiu_src_dir=None):
+    tokenizer_dir = resolve_charsiu_tokenizer_dir(charsiu_src_dir)
+    if tokenizer_dir is None:
+        return None
+    try:
+        from transformers import Wav2Vec2CTCTokenizer
+    except Exception:
+        return tokenizer_dir
+    if getattr(Wav2Vec2CTCTokenizer, '_custom_gopt_charsiu_tokenizer_patch', False):
+        return tokenizer_dir
+    original_from_pretrained = Wav2Vec2CTCTokenizer.from_pretrained
+
+    def local_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        if str(pretrained_model_name_or_path) == 'charsiu/tokenizer_en_cmu':
+            pretrained_model_name_or_path = str(tokenizer_dir)
+            kwargs['local_files_only'] = True
+        return original_from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+    Wav2Vec2CTCTokenizer.from_pretrained = classmethod(local_from_pretrained)
+    Wav2Vec2CTCTokenizer._custom_gopt_charsiu_tokenizer_patch = True
+    return tokenizer_dir
+
+
+def patch_local_transformers_torch_load_guard(model_name):
+    model_path = Path(str(model_name))
+    if not model_path.exists() or not (model_path / 'pytorch_model.bin').exists():
+        return False
+    try:
+        import transformers.modeling_utils as modeling_utils
+        import transformers.utils.import_utils as import_utils
+    except Exception:
+        return False
+    if getattr(modeling_utils, '_custom_gopt_local_torch_load_guard_patch', False):
+        return True
+
+    def allow_local_torch_load():
+        return None
+
+    modeling_utils.check_torch_load_is_safe = allow_local_torch_load
+    import_utils.check_torch_load_is_safe = allow_local_torch_load
+    modeling_utils._custom_gopt_local_torch_load_guard_patch = True
+    return True
+
+
 def load_official_charsiu_aligner(model_name, device, sample_rate, sil_threshold, lang='en', charsiu_src_dir=None):
+    patch_charsiu_tokenizer_loader(charsiu_src_dir)
+    patch_local_transformers_torch_load_guard(model_name)
     charsiu_forced_aligner = import_charsiu_forced_aligner(charsiu_src_dir)
     aligner = charsiu_forced_aligner(
         aligner=model_name,

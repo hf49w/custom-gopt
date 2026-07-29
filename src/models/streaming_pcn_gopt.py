@@ -69,6 +69,9 @@ class PCNStreamingScorer(nn.Module):
         slot_prosody_embed_dim=8,
         stress_branch='none',
         stress_grad_scale=0.2,
+        use_acoustic=True,
+        use_prosody=True,
+        use_uncertainty_stats=True,
     ):
         super().__init__()
         self.phone_dim = int(phone_dim)
@@ -83,11 +86,14 @@ class PCNStreamingScorer(nn.Module):
         self.slot_prosody_dim = int(slot_prosody_dim or 0)
         self.stress_branch = str(stress_branch)
         self.stress_grad_scale = float(stress_grad_scale)
+        self.use_acoustic = bool(use_acoustic)
+        self.use_prosody = bool(use_prosody)
+        self.use_uncertainty_stats = bool(use_uncertainty_stats)
 
-        if self.utt_pooling_head not in {'gru', 'gru_visible'}:
-            raise ValueError("utt_pooling_head must be 'gru' or 'gru_visible'.")
-        if self.fusion_mode not in {'scalar_gate', 'concat_vector_gate'}:
-            raise ValueError("fusion_mode must be 'scalar_gate' or 'concat_vector_gate'.")
+        if self.utt_pooling_head not in {'gru', 'gru_visible', 'visible_committed'}:
+            raise ValueError("utt_pooling_head must be 'gru', 'gru_visible', or 'visible_committed'.")
+        if self.fusion_mode not in {'scalar_gate', 'concat_vector_gate', 'fixed_average'}:
+            raise ValueError("fusion_mode must be 'scalar_gate', 'concat_vector_gate', or 'fixed_average'.")
         if self.stress_branch not in {'none', 'detached', 'gradscale'}:
             raise ValueError("stress_branch must be 'none', 'detached', or 'gradscale'.")
 
@@ -99,19 +105,28 @@ class PCNStreamingScorer(nn.Module):
             nn.LayerNorm(pcn_embed_dim),
             nn.GELU(),
         )
-        self.acoustic_proj = nn.Sequential(
-            nn.Linear(self.phone_dim + 4, acoustic_embed_dim),
-            nn.LayerNorm(acoustic_embed_dim),
-            nn.GELU(),
-        )
-        self.prosody_proj = nn.Sequential(
-            nn.Linear(self.prosody_dim, max(16, prosody_embed_dim * 2)),
-            nn.GELU(),
-            nn.Linear(max(16, prosody_embed_dim * 2), prosody_embed_dim),
-            nn.LayerNorm(prosody_embed_dim),
-        )
-        gate_dim = pcn_embed_dim if self.fusion_mode == 'concat_vector_gate' else 1
-        self.reliability_gate = ReliabilityGate(output_dim=gate_dim)
+        self.acoustic_proj = None
+        if self.use_acoustic:
+            self.acoustic_proj = nn.Sequential(
+                nn.Linear(self.phone_dim + 4, acoustic_embed_dim),
+                nn.LayerNorm(acoustic_embed_dim),
+                nn.GELU(),
+            )
+        self.prosody_proj = None
+        prosody_fused_dim = 0
+        if self.use_prosody:
+            prosody_fused_dim = int(prosody_embed_dim)
+            self.prosody_proj = nn.Sequential(
+                nn.Linear(self.prosody_dim, max(16, prosody_embed_dim * 2)),
+                nn.GELU(),
+                nn.Linear(max(16, prosody_embed_dim * 2), prosody_embed_dim),
+                nn.LayerNorm(prosody_embed_dim),
+            )
+        if self.use_acoustic and self.fusion_mode != 'fixed_average':
+            gate_dim = pcn_embed_dim if self.fusion_mode == 'concat_vector_gate' else 1
+            self.reliability_gate = ReliabilityGate(output_dim=gate_dim)
+        else:
+            self.reliability_gate = None
         self.slot_prosody_proj = None
         slot_prosody_fused_dim = 0
         if self.slot_prosody_dim > 0:
@@ -122,9 +137,14 @@ class PCNStreamingScorer(nn.Module):
                 nn.Linear(max(16, slot_prosody_fused_dim * 2), slot_prosody_fused_dim),
                 nn.LayerNorm(slot_prosody_fused_dim),
             )
-        evidence_dim = pcn_embed_dim * 4 if self.fusion_mode == 'concat_vector_gate' else pcn_embed_dim
+        if not self.use_acoustic:
+            evidence_dim = pcn_embed_dim
+        elif self.fusion_mode == 'concat_vector_gate':
+            evidence_dim = pcn_embed_dim * 4
+        else:
+            evidence_dim = pcn_embed_dim
         self.fused_proj = nn.Sequential(
-            nn.Linear(evidence_dim + prosody_embed_dim + slot_prosody_fused_dim, embed_dim),
+            nn.Linear(evidence_dim + prosody_fused_dim + slot_prosody_fused_dim, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.Dropout(dropout),
         )
@@ -145,7 +165,9 @@ class PCNStreamingScorer(nn.Module):
         )
 
         self.word_pool_proj = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, embed_dim), nn.GELU())
-        self.sentence_gru = nn.GRU(input_size=embed_dim, hidden_size=gru_dim, batch_first=True)
+        self.sentence_gru = None
+        if self.utt_pooling_head != 'visible_committed':
+            self.sentence_gru = nn.GRU(input_size=embed_dim, hidden_size=gru_dim, batch_first=True)
 
         self.phone_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.word_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 3))
@@ -156,10 +178,15 @@ class PCNStreamingScorer(nn.Module):
         self.uncertainty_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.confidence_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
         self.abstention_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.utt_head = nn.Sequential(nn.LayerNorm(gru_dim), nn.Linear(gru_dim, 5))
+        self.utt_head = None
+        if self.utt_pooling_head == 'gru':
+            self.utt_head = nn.Sequential(nn.LayerNorm(gru_dim), nn.Linear(gru_dim, 5))
         self.utt_visible_head = None
         if self.utt_pooling_head == 'gru_visible':
             visible_dim = gru_dim + embed_dim + embed_dim + 2
+            self.utt_visible_head = nn.Sequential(nn.LayerNorm(visible_dim), nn.Linear(visible_dim, 5))
+        elif self.utt_pooling_head == 'visible_committed':
+            visible_dim = embed_dim + embed_dim + 2
             self.utt_visible_head = nn.Sequential(nn.LayerNorm(visible_dim), nn.Linear(visible_dim, 5))
         self.state_projection = (
             nn.Sequential(nn.LayerNorm(gru_dim), nn.Linear(gru_dim, int(teacher_state_dim)))
@@ -181,16 +208,35 @@ class PCNStreamingScorer(nn.Module):
         return mask | diag
 
     def encode_slots(self, cn_post, cn_stats, acoustic_post, acoustic_stats, prosody, valid_mask, slot_prosody=None):
+        if not self.use_uncertainty_stats:
+            cn_stats = cn_stats.clone()
+            acoustic_stats = acoustic_stats.clone()
+            cn_stats[..., 1] = 0.0  # PCN entropy
+            cn_stats[..., 3] = 0.0  # PCN margin
+            cn_stats[..., 4] = 0.0  # prefix stability
+            acoustic_stats[..., 0] = 0.0  # acoustic entropy
+            acoustic_stats[..., 1] = 0.0  # acoustic margin
+            acoustic_stats[..., 3] = 0.0  # PCN/Charsiu JS divergence
         z_pcn = self.pcn_proj(torch.cat([cn_post, cn_stats], dim=-1))
-        z_acoustic = self.acoustic_proj(torch.cat([acoustic_post, acoustic_stats], dim=-1))
-        z_prosody = self.prosody_proj(prosody).unsqueeze(1).expand(-1, cn_post.shape[1], -1)
-        gate = self.reliability_gate(cn_stats, acoustic_stats)
-        interpolation = gate * z_acoustic + (1.0 - gate) * z_pcn
-        if self.fusion_mode == 'concat_vector_gate':
-            evidence = torch.cat([z_pcn, z_acoustic, z_acoustic - z_pcn, interpolation], dim=-1)
+        if self.use_acoustic:
+            z_acoustic = self.acoustic_proj(torch.cat([acoustic_post, acoustic_stats], dim=-1))
+            if self.fusion_mode == 'fixed_average':
+                gate = cn_post.new_full((*cn_post.shape[:2], 1), 0.5)
+                interpolation = 0.5 * z_acoustic + 0.5 * z_pcn
+            else:
+                gate = self.reliability_gate(cn_stats, acoustic_stats)
+                interpolation = gate * z_acoustic + (1.0 - gate) * z_pcn
+            if self.fusion_mode == 'concat_vector_gate':
+                evidence = torch.cat([z_pcn, z_acoustic, z_acoustic - z_pcn, interpolation], dim=-1)
+            else:
+                evidence = interpolation
         else:
-            evidence = interpolation
-        fused_parts = [evidence, z_prosody]
+            gate = cn_post.new_zeros((*cn_post.shape[:2], 1))
+            evidence = z_pcn
+        fused_parts = [evidence]
+        if self.prosody_proj is not None:
+            z_prosody = self.prosody_proj(prosody).unsqueeze(1).expand(-1, cn_post.shape[1], -1)
+            fused_parts.append(z_prosody)
         if self.slot_prosody_proj is not None:
             if slot_prosody is None:
                 slot_prosody = cn_post.new_zeros(cn_post.shape[0], cn_post.shape[1], self.slot_prosody_dim)
@@ -298,7 +344,10 @@ class PCNStreamingScorer(nn.Module):
         token, gate = self.encode_slots(cn_post, cn_stats, acoustic_post, acoustic_stats, prosody, valid_mask, slot_prosody=slot_prosody)
         slot_hidden = self.local_causal_transformer(token, valid_mask)
         new_words, new_word_mask = self.pool_new_committed_words(slot_hidden, new_commit_mask, word_ids=word_ids)
-        final_state = self.update_sentence_state(new_words, new_word_mask, prev_state)
+        if self.sentence_gru is None:
+            final_state = slot_hidden.new_zeros(1, batch_size, self.gru_dim)
+        else:
+            final_state = self.update_sentence_state(new_words, new_word_mask, prev_state)
         next_state = final_state.detach() if detach_next_state else final_state
         sentence_state = final_state[-1]
 
@@ -306,12 +355,15 @@ class PCNStreamingScorer(nn.Module):
         abstention_logit = self.abstention_head(slot_hidden)
         confidence = torch.sigmoid(confidence_logit)
         abstention_probability = torch.sigmoid(abstention_logit)
-        if self.utt_pooling_head == 'gru_visible':
+        if self.utt_pooling_head in {'gru_visible', 'visible_committed'}:
             committed_pool = masked_mean(slot_hidden, cumulative_commit_mask, dim=1)
             visible_pool = masked_mean(slot_hidden, valid_mask, dim=1)
             mean_confidence = masked_mean(confidence, valid_mask, dim=1)
             mean_abstention = masked_mean(abstention_probability, valid_mask, dim=1)
-            utt_input = torch.cat([sentence_state, committed_pool, visible_pool, mean_confidence, mean_abstention], dim=-1)
+            if self.utt_pooling_head == 'gru_visible':
+                utt_input = torch.cat([sentence_state, committed_pool, visible_pool, mean_confidence, mean_abstention], dim=-1)
+            else:
+                utt_input = torch.cat([committed_pool, visible_pool, mean_confidence, mean_abstention], dim=-1)
             utt_scores = self.utt_visible_head(utt_input)
         else:
             utt_scores = self.utt_head(sentence_state)

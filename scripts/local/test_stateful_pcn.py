@@ -179,6 +179,44 @@ def test_detached_stress_branch_forward_shape():
     assert out['word_scores'].shape == (1, seq_len, 3), 'detached stress branch should keep word score shape'
 
 
+def test_task5_ablation_forward_shapes():
+    phone_dim = 5
+    seq_len = 4
+    configs = [
+        {'fusion_mode': 'fixed_average'},
+        {'use_acoustic': False},
+        {'use_prosody': False},
+        {'use_uncertainty_stats': False},
+        {'utt_pooling_head': 'visible_committed'},
+    ]
+    cn_post, cn_stats, acoustic_post, acoustic_stats, prosody, word_ids = make_chunk(phone_dim, seq_len)
+    for kwargs in configs:
+        model = PCNStreamingScorer(
+            phone_dim=phone_dim,
+            seq_len=seq_len,
+            embed_dim=16,
+            gru_dim=12,
+            depth=1,
+            num_heads=1,
+            **kwargs,
+        )
+        model.eval()
+        out = model(
+            cn_post,
+            cn_stats,
+            acoustic_post,
+            acoustic_stats,
+            prosody,
+            visible_len=torch.tensor([seq_len]),
+            cumulative_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+            new_commit_mask=torch.tensor([[1, 1, 0, 0]], dtype=torch.float32),
+            word_ids=word_ids,
+        )
+        assert out['phone_score'].shape == (1, seq_len, 1), f'{kwargs} should keep phone score shape'
+        assert out['word_scores'].shape == (1, seq_len, 3), f'{kwargs} should keep word score shape'
+        assert out['utt_scores'].shape == (1, 5), f'{kwargs} should keep utterance score shape'
+
+
 def test_relaxed_supervision_weight():
     cn_post = torch.zeros(1, 3, 5)
     acoustic_post = torch.zeros(1, 3, 5)
